@@ -21,3 +21,6 @@ orchestrator_report_*.md
 # Personal Claude Code files
 CLAUDE.local.md
 .claude/settings.local.json
+
+# Personal machine config (use config.example.toml as the template)
+config.toml
