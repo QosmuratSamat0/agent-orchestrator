@@ -87,6 +87,12 @@ class Orchestrator:
             total_timeout_sec=self.config.total_task_timeout_sec,
         )
 
+    def close(self) -> None:
+        try:
+            self.bridge.close()
+        except Exception:
+            logger.warning("Не удалось закрыть соединение Agent-Bridge", exc_info=True)
+
     def _log_progress(self, task: Task, message: str) -> None:
         if self.progress:
             try:

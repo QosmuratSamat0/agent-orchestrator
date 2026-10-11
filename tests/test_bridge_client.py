@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 import pytest
@@ -16,11 +19,23 @@ def mini_mcp_server(tmp_path: Path) -> Path:
     server_code = """
 import sys
 import json
+import os
+import signal
+import subprocess
 import time
+from pathlib import Path
+
+if os.environ.get("FAKE_STUBBORN"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    Path(os.environ["FAKE_CHILD_PID"]).write_text(str(child.pid), encoding="ascii")
 
 while True:
     line = sys.stdin.readline()
     if not line:
+        if os.environ.get("FAKE_STUBBORN"):
+            while True:
+                time.sleep(60)
         break
     try:
         req = json.loads(line)
@@ -50,6 +65,27 @@ while True:
         params = req.get("params", {})
         tool_name = params.get("name")
         args = params.get("arguments", {})
+
+        if tool_name == "invalid_utf8":
+            sys.stdout.buffer.write(b"noise: \\xff\\n")
+            sys.stdout.buffer.flush()
+            sys.stderr.buffer.write(b"stderr: \\xff\\n")
+            sys.stderr.buffer.flush()
+
+        if tool_name == "stderr_5mb":
+            sys.stderr.buffer.write(b"E" * (5 * 1024 * 1024))
+            sys.stderr.buffer.flush()
+            sys.stderr.buffer.write(b"\\nmore stderr\\n")
+            sys.stderr.buffer.flush()
+
+        if tool_name in ("server_ping", "server_unknown"):
+            method_name = "ping" if tool_name == "server_ping" else "unknown/method"
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": method_name,
+                                         "id": 9001}) + "\\n")
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "server/notice"}) + "\\n")
+            sys.stdout.flush()
+            client_reply = json.loads(sys.stdin.readline())
+            Path(args["record"]).write_text(json.dumps(client_reply), encoding="utf-8")
 
         if tool_name == "hang":
             # Hang without printing to stdout
@@ -181,6 +217,8 @@ while True:
             }
             sys.stdout.write(json.dumps(resp) + "\\n")
             sys.stdout.flush()
+if os.environ.get("FAKE_EOF_MARKER"):
+    Path(os.environ["FAKE_EOF_MARKER"]).write_text("closed", encoding="utf-8")
 """
     script_file = tmp_path / "mini_server.py"
     script_file.write_text(server_code, encoding="utf-8")
@@ -347,5 +385,114 @@ def test_bridge_client_reconnect_method(mini_mcp_server: Path):
         assert res.get("ok") is True
     finally:
         client.close()
+
+
+def test_invalid_utf8_does_not_stop_readers(mini_mcp_server: Path):
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)])
+    try:
+        client.connect()
+        assert client.call_tool("invalid_utf8", {}, timeout=3)["ok"]
+        assert client.call_tool("normal_tool", {}, timeout=3)["ok"]
+        assert client._stderr_thread is not None and client._stderr_thread.is_alive()
+        assert "\ufffd" in client.get_stderr_tail()
+    finally:
+        client.close()
+
+
+def test_large_unterminated_stderr_line_does_not_block(mini_mcp_server: Path):
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)])
+    try:
+        client.connect()
+        assert client.call_tool("stderr_5mb", {}, timeout=10)["ok"]
+        for _ in range(19):
+            assert client.call_tool("normal_tool", {}, timeout=3)["ok"]
+        deadline = time.monotonic() + 3
+        while not client.get_stderr_tail() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert client._stderr_buffer
+        assert all(len(line) <= 4000 for line in client._stderr_buffer)
+        assert client.call_tool("normal_tool", {}, timeout=3)["ok"]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("tool,expected", [
+    ("server_ping", {"result": {}}),
+    ("server_unknown", {"error": {"code": -32601, "message": "Method not found"}}),
+])
+def test_server_request_and_notification(mini_mcp_server: Path, tmp_path: Path, tool, expected):
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)])
+    record = tmp_path / "reply.json"
+    try:
+        client.connect()
+        assert client.call_tool(tool, {"record": str(record)}, timeout=3)["ok"]
+        reply = json.loads(record.read_text(encoding="utf-8"))
+        assert reply == {"jsonrpc": "2.0", "id": 9001, **expected}
+    finally:
+        client.close()
+
+
+def test_graceful_close_after_eof(mini_mcp_server: Path, tmp_path: Path, monkeypatch):
+    marker = tmp_path / "closed.txt"
+    monkeypatch.setenv("FAKE_EOF_MARKER", str(marker))
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)], close_grace_sec=2)
+    client.connect()
+    proc = client.proc
+    started = time.monotonic()
+    client.close()
+    assert time.monotonic() - started < 2
+    assert marker.read_text(encoding="utf-8") == "closed"
+    assert proc.poll() is not None
+    client.close()
+    BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)]).close()
+
+
+def test_crash_then_automatic_restart(mini_mcp_server: Path):
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)])
+    try:
+        client.connect()
+        assert client.restart_count == 0
+        with pytest.raises(BridgeError):
+            client.call_tool("crash", {}, timeout=3)
+        assert client.call_tool("normal_tool", {}, timeout=3)["ok"]
+        assert client.restart_count == 1
+    finally:
+        client.close()
+
+
+def test_thirty_connect_close_cycles_restore_threads(mini_mcp_server: Path):
+    before = threading.active_count()
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)])
+    pids = []
+    for _ in range(30):
+        client.connect()
+        pids.append(client.proc)
+        client.close()
+    assert all(proc.poll() is not None for proc in pids)
+    assert abs(threading.active_count() - before) <= 1
+
+
+def test_stubborn_server_tree_is_stopped(mini_mcp_server: Path, tmp_path: Path, monkeypatch):
+    if os.name == "nt":
+        probe = subprocess.run(["tasklist", "/FI", "PID eq 0"], capture_output=True, text=True)
+        if probe.returncode != 0 and "Access denied" in (probe.stdout + probe.stderr):
+            pytest.skip("Среда запрещает tasklist/taskkill; завершение дерева нельзя проверить")
+    pid_file = tmp_path / "child.pid"
+    monkeypatch.setenv("FAKE_STUBBORN", "1")
+    monkeypatch.setenv("FAKE_CHILD_PID", str(pid_file))
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)], close_grace_sec=0.2)
+    client.connect()
+    parent_pid = client.proc.pid
+    child_pid = int(pid_file.read_text(encoding="ascii"))
+    started = time.monotonic()
+    client.close()
+    assert time.monotonic() - started < 15
+    for pid in (parent_pid, child_pid):
+        if os.name == "nt":
+            listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+            assert str(pid) not in listing.stdout
+        else:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
 
 

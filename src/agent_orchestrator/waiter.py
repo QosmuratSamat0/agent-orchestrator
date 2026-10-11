@@ -43,6 +43,16 @@ class NonLLMWaiter:
         self.base_backoff_sec = base_backoff_sec
         self.max_backoff_sec = max_backoff_sec
 
+    @staticmethod
+    def _reject_orphan(resp: object) -> None:
+        if isinstance(resp, dict) and resp.get("from_state"):
+            status = str(resp.get("status", "")).lower().strip()
+            if status in RUNNING_STATUSES | QUEUED_STATUSES:
+                raise BridgeError(
+                    "Задача принадлежит прежнему процессу Agent-Bridge: ожидание и отмена невозможны. "
+                    "Проверьте worker вручную перед повторным запуском."
+                )
+
     def _sleep_with_checks(
         self,
         duration: float,
@@ -111,6 +121,7 @@ class NonLLMWaiter:
             f"(chunk={self.wait_chunk_sec}s, total_max={effective_timeout}s)"
         )
         consecutive_errors = 0
+        fallback_rounds = 0
 
         while True:
             # Check user cancellation
@@ -142,10 +153,17 @@ class NonLLMWaiter:
             current_chunk = min(self.wait_chunk_sec, remaining)
             resp: Optional[Dict[str, Any]] = None
             poll_error: Optional[str] = None
+            used_fallback = False
 
             # Attempt 1: wait_task
             try:
                 resp = self.bridge.wait_task(bridge_task_id, timeout_sec=current_chunk)
+            except Exception as e:
+                logger.warning(f"wait_task RPC error: {e}")
+                poll_error = f"wait_task exception: {e}"
+                resp = None
+            else:
+                self._reject_orphan(resp)
                 if not isinstance(resp, dict):
                     poll_error = (
                         f"Invalid response type from wait_task: {type(resp).__name__}"
@@ -156,18 +174,22 @@ class NonLLMWaiter:
                     logger.warning(f"wait_task returned ok=false: {err_msg}")
                     poll_error = f"wait_task ok=false: {err_msg}"
                     resp = None
-            except Exception as e:
-                logger.warning(f"wait_task RPC error: {e}")
-                poll_error = f"wait_task exception: {e}"
-                resp = None
+                else:
+                    fallback_rounds = 0
 
             # If wait_task failed or returned ok=false, attempt fallback check_task
             if resp is None:
                 try:
                     check_resp = self.bridge.check_task(bridge_task_id)
+                except Exception as e:
+                    logger.warning(f"check_task fallback exception: {e}")
+                    poll_error = f"{poll_error}; check_task exception: {e}"
+                else:
+                    self._reject_orphan(check_resp)
                     if isinstance(check_resp, dict) and check_resp.get("ok", True):
                         resp = check_resp
                         poll_error = None
+                        used_fallback = True
                     else:
                         err_msg = (
                             check_resp.get("error", "check_task ok=false")
@@ -176,9 +198,6 @@ class NonLLMWaiter:
                         )
                         logger.warning(f"check_task fallback also failed: {err_msg}")
                         poll_error = f"{poll_error}; check_task failed: {err_msg}"
-                except Exception as e:
-                    logger.warning(f"check_task fallback exception: {e}")
-                    poll_error = f"{poll_error}; check_task exception: {e}"
 
             # If both wait_task and check_task failed
             if resp is None or poll_error is not None:
@@ -235,14 +254,12 @@ class NonLLMWaiter:
                 logger.warning(f"Task {bridge_task_id} was cancelled by bridge.")
                 return resp
 
-            elif status_str in RUNNING_STATUSES:
+            elif status_str in RUNNING_STATUSES | QUEUED_STATUSES:
                 consecutive_errors = 0
-                self._sleep_with_checks(0.2, start_time, bridge_task_id, should_cancel, total_timeout=effective_timeout)
-                continue
-
-            elif status_str in QUEUED_STATUSES:
-                consecutive_errors = 0
-                self._sleep_with_checks(0.2, start_time, bridge_task_id, should_cancel, total_timeout=effective_timeout)
+                if used_fallback:
+                    fallback_rounds += 1
+                backoff = min(self.max_backoff_sec, self.base_backoff_sec * (2 ** (fallback_rounds - 1))) if used_fallback else 0.2
+                self._sleep_with_checks(backoff, start_time, bridge_task_id, should_cancel, total_timeout=effective_timeout)
                 continue
 
             else:

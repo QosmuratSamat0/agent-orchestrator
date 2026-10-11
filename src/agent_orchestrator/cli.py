@@ -52,148 +52,172 @@ def print_step(step: str, task: Task) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
-    if orchestrator.progress:
-        orchestrator.progress.echo = print
+    try:
+        if orchestrator.progress:
+            orchestrator.progress.echo = print
 
-    print("=" * 60)
-    print("🤖 AGENT ORCHESTRATOR - ЗАПУСК КООРДИНАЦИИ")
-    print("=" * 60)
-    print(f"Заголовок: {args.title}")
-    print(f"Каталог:   {args.cwd or os.getcwd()}")
+        print("=" * 60)
+        print("🤖 AGENT ORCHESTRATOR - ЗАПУСК КООРДИНАЦИИ")
+        print("=" * 60)
+        print(f"Заголовок: {args.title}")
+        print(f"Каталог:   {args.cwd or os.getcwd()}")
 
-    task = orchestrator.create_task(
-        title=args.title,
-        prompt=args.prompt,
-        acceptance_criteria=args.criteria or "",
-        cwd=args.cwd,
-        model=args.model,
-        effort=args.effort,
-    )
+        task = orchestrator.create_task(
+            title=args.title,
+            prompt=args.prompt,
+            acceptance_criteria=args.criteria or "",
+            cwd=args.cwd,
+            model=args.model,
+            effort=args.effort,
+        )
 
-    print(f"ID задачи: {task.id}")
-    print(f"Выбранная модель: {task.model} (effort: {task.effort})")
-    print(f"Обоснование:      {task.model_reason}")
+        print(f"ID задачи: {task.id}")
+        print(f"Выбранная модель: {task.model} (effort: {task.effort})")
+        print(f"Обоснование:      {task.model_reason}")
 
-    completed_task = orchestrator.run_task(task.id, on_step_callback=print_step)
+        completed_task = orchestrator.run_task(task.id, on_step_callback=print_step)
 
-    print("\n" + "=" * 60)
-    print(f"🏁 РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ: {completed_task.status.value.upper()}")
-    print("=" * 60)
-    if completed_task.status == TaskStatus.COMPLETED:
-        print("✅ Задача успешно выполнена и полностью подтверждена верификатором Codex!")
-    else:
-        print(f"❌ Задача завершилась со статусом: {completed_task.status.value}")
-        if completed_task.error_message:
-            print(f"Причина: {completed_task.error_message}")
+        print("\n" + "=" * 60)
+        print(f"🏁 РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ: {completed_task.status.value.upper()}")
+        print("=" * 60)
+        if completed_task.status == TaskStatus.COMPLETED:
+            print("✅ Задача успешно выполнена и полностью подтверждена верификатором Codex!")
+        else:
+            print(f"❌ Задача завершилась со статусом: {completed_task.status.value}")
+            if completed_task.error_message:
+                print(f"Причина: {completed_task.error_message}")
 
-    report_path = Path(completed_task.cwd) / f"orchestrator_report_{completed_task.id[:8]}.md"
-    if report_path.exists():
-        print(f"\n📄 Итоговый отчёт сохранён: {report_path}")
+        report_path = Path(completed_task.cwd) / f"orchestrator_report_{completed_task.id[:8]}.md"
+        if report_path.exists():
+            print(f"\n📄 Итоговый отчёт сохранён: {report_path}")
+    finally:
+        orchestrator.close()
 
 
 def cmd_submit(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    task = orchestrator.create_task(
-        title=args.title,
-        prompt=args.prompt,
-        acceptance_criteria=args.criteria or "",
-        cwd=args.cwd,
-        model=args.model,
-        effort=args.effort,
-    )
-    print(f"Задача добавлена в очередь! ID: {task.id}")
-    print(f"Модель: {task.model} (effort: {task.effort})")
+        task = orchestrator.create_task(
+            title=args.title,
+            prompt=args.prompt,
+            acceptance_criteria=args.criteria or "",
+            cwd=args.cwd,
+            model=args.model,
+            effort=args.effort,
+        )
+        print(f"Задача добавлена в очередь! ID: {task.id}")
+        print(f"Модель: {task.model} (effort: {task.effort})")
+    finally:
+        orchestrator.close()
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    task = orchestrator.repo.get_task(args.task_id) if args.task_id else orchestrator.repo.get_active_task()
-    if not task:
-        print("Задача не найдена.")
-        return
+        task = orchestrator.repo.get_task(args.task_id) if args.task_id else orchestrator.repo.get_active_task()
+        if not task:
+            print("Задача не найдена.")
+            return
 
-    print("=" * 50)
-    print(f"Задача:    {task.title} ({task.id})")
-    print(f"Статус:    {task.status.value}")
-    print(f"Модель:    {task.model} ({task.effort})")
-    print(f"Попыток:   {task.retry_count}")
-    print(f"Создана:   {task.created_at}")
-    print(f"Обновлена: {task.updated_at}")
-    if task.verification_verdict:
-        print(f"Вердикт:   {task.verification_verdict.value}")
-    if task.error_message:
-        print(f"Ошибка:    {task.error_message}")
-    print("=" * 50)
+        print("=" * 50)
+        print(f"Задача:    {task.title} ({task.id})")
+        print(f"Статус:    {task.status.value}")
+        print(f"Модель:    {task.model} ({task.effort})")
+        print(f"Попыток:   {task.retry_count}")
+        print(f"Создана:   {task.created_at}")
+        print(f"Обновлена: {task.updated_at}")
+        if task.verification_verdict:
+            print(f"Вердикт:   {task.verification_verdict.value}")
+        if task.error_message:
+            print(f"Ошибка:    {task.error_message}")
+        print("=" * 50)
+    finally:
+        orchestrator.close()
 
 
 def cmd_list(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    status_filter = TaskStatus(args.status) if args.status else None
-    tasks = orchestrator.repo.list_tasks(status=status_filter)
+        status_filter = TaskStatus(args.status) if args.status else None
+        tasks = orchestrator.repo.list_tasks(status=status_filter)
 
-    print(f"{'ID':<10} {'СТАТУС':<12} {'МОДЕЛЬ':<24} {'ПОПЫТКИ':<8} {'ЗАГОЛОВОК'}")
-    print("-" * 75)
-    for t in tasks:
-        print(f"{t.id[:8]:<10} {t.status.value:<12} {t.model:<24} {str(t.retry_count):<8} {t.title[:30]}")
+        print(f"{'ID':<10} {'СТАТУС':<12} {'МОДЕЛЬ':<24} {'ПОПЫТКИ':<8} {'ЗАГОЛОВОК'}")
+        print("-" * 75)
+        for t in tasks:
+            print(f"{t.id[:8]:<10} {t.status.value:<12} {t.model:<24} {str(t.retry_count):<8} {t.title[:30]}")
+    finally:
+        orchestrator.close()
 
 
 def cmd_recover(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    print("Запуск процедуры восстановления прерванных задач после перезапуска...")
-    recovered = orchestrator.recover()
-    if not recovered:
-        print("Прерванных задач не обнаружено.")
-    else:
-        print(f"Восстановлено и обработано задач: {len(recovered)}")
-        for t in recovered:
-            print(f"- {t.id[:8]}: {t.status.value}")
+        print("Запуск процедуры восстановления прерванных задач после перезапуска...")
+        recovered = orchestrator.recover()
+        if not recovered:
+            print("Прерванных задач не обнаружено.")
+        else:
+            print(f"Восстановлено и обработано задач: {len(recovered)}")
+            for t in recovered:
+                print(f"- {t.id[:8]}: {t.status.value}")
+    finally:
+        orchestrator.close()
 
 
 def cmd_cancel(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    task = orchestrator.cancel_task(args.task_id)
-    print(f"Задача {task.id[:8]} переведена в статус: {task.status.value}")
+        task = orchestrator.cancel_task(args.task_id)
+        print(f"Задача {task.id[:8]} переведена в статус: {task.status.value}")
+    finally:
+        orchestrator.close()
 
 
 def cmd_models(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    print("=== ПОДТВЕРЖДЁННЫЕ МОДЕЛИ ANTIGRAVITY (AGY MODELS) ===")
-    for m in sorted(orchestrator.router.available_models):
-        print(f"  • {m}")
+        print("=== ПОДТВЕРЖДЁННЫЕ МОДЕЛИ ANTIGRAVITY (AGY MODELS) ===")
+        for m in sorted(orchestrator.router.available_models):
+            print(f"  • {m}")
 
-    print("\n=== КОНФИГУРАЦИЯ МАРШРУТИЗАЦИИ ПО СЛОЖНОСТИ ===")
-    print(f"  trivial  -> {config.models.trivial}")
-    print(f"  simple   -> {config.models.simple}")
-    print(f"  moderate -> {config.models.moderate}")
-    print(f"  complex  -> {config.models.complex}")
-    print(f"  expert   -> {config.models.expert}")
-    print(f"  fallback -> {config.models.fallback}")
+        print("\n=== КОНФИГУРАЦИЯ МАРШРУТИЗАЦИИ ПО СЛОЖНОСТИ ===")
+        print(f"  trivial  -> {config.models.trivial}")
+        print(f"  simple   -> {config.models.simple}")
+        print(f"  moderate -> {config.models.moderate}")
+        print(f"  complex  -> {config.models.complex}")
+        print(f"  expert   -> {config.models.expert}")
+        print(f"  fallback -> {config.models.fallback}")
+    finally:
+        orchestrator.close()
 
 
 def cmd_report(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    try:
 
-    task = orchestrator.repo.get_task(args.task_id)
-    if not task:
-        print(f"Задача с ID {args.task_id} не найдена.")
-        return
+        task = orchestrator.repo.get_task(args.task_id)
+        if not task:
+            print(f"Задача с ID {args.task_id} не найдена.")
+            return
 
-    events = orchestrator.repo.get_events(task.id)
-    report = orchestrator.retry_controller.generate_final_report(task, events=events)
-    print(report)
+        events = orchestrator.repo.get_events(task.id)
+        report = orchestrator.retry_controller.generate_final_report(task, events=events)
+        print(report)
+    finally:
+        orchestrator.close()
 
 
 def cmd_watch(args: argparse.Namespace) -> None:

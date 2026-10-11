@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -325,6 +327,85 @@ def test_orchestrator_bridge_error_sqlite_state_and_events(
     events = repo.get_events(task.id)
     event_types = [e.event_type for e in events]
     assert "TASK_FAILED" in event_types
+
+
+def test_live_orphan_bridge_error_marks_task_failed(repo, mock_bridge, mock_verifier, tmp_path):
+    class OrphanWaiter(NonLLMWaiter):
+        def wait_for_completion(self, bridge_task_id, **kwargs):
+            raise BridgeError("Задача принадлежит прежнему процессу Agent-Bridge: ожидание и отмена невозможны.")
+
+    orchestrator = Orchestrator(
+        repository=repo, bridge=mock_bridge, verifier=mock_verifier,
+        waiter=OrphanWaiter(bridge=mock_bridge),
+    )
+    task = orchestrator.create_task(title="Осиротевшая задача", prompt="Проверка", cwd=str(tmp_path))
+    result = orchestrator.run_task(task.id)
+    assert result.status == TaskStatus.FAILED
+    assert "прежнему процессу Agent-Bridge" in result.error_message
+    assert any(e.event_type == "TASK_FAILED" and "прежнему процессу" in e.payload["error"]
+               for e in repo.get_events(task.id))
+    assert mock_verifier.verification_calls == []
+
+
+def test_orchestrator_close_is_best_effort(repo, mock_verifier):
+    class BrokenCloseBridge(MockBridgeClient):
+        def close(self):
+            raise RuntimeError("Сбой закрытия")
+
+    orchestrator = Orchestrator(repository=repo, bridge=BrokenCloseBridge(), verifier=mock_verifier)
+    orchestrator.close()
+
+
+def test_cli_handlers_always_close_fake_orchestrator(monkeypatch, tmp_path):
+    from agent_orchestrator import cli
+
+    config = OrchestratorConfig(db_path=str(tmp_path / "cli.sqlite"))
+    monkeypatch.setattr(cli.OrchestratorConfig, "load", lambda *_: config)
+    closed = []
+    task = Task(title="Тест", prompt="Проверка", cwd=str(tmp_path))
+    task.mark_completed()
+
+    class FakeOrchestrator:
+        def __init__(self, config):
+            self.progress = None
+            self.repo = SimpleNamespace(
+                get_task=lambda *_: task, get_active_task=lambda: task,
+                list_tasks=lambda **_: [task], get_events=lambda *_: [],
+            )
+            self.router = SimpleNamespace(available_models=set())
+            self.retry_controller = SimpleNamespace(generate_final_report=lambda *_, **__: "Отчёт")
+
+        def create_task(self, **kwargs):
+            return task
+
+        def run_task(self, *args, **kwargs):
+            return task
+
+        def recover(self):
+            return []
+
+        def cancel_task(self, *_):
+            return task
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
+    args = argparse.Namespace(config=None, title="Тест", prompt="Проверка", criteria="",
+                              cwd=str(tmp_path), model=None, effort=None, task_id=task.id, status=None)
+    for handler in (cli.cmd_run, cli.cmd_submit, cli.cmd_status, cli.cmd_list,
+                    cli.cmd_recover, cli.cmd_cancel, cli.cmd_models, cli.cmd_report):
+        handler(args)
+    assert len(closed) == 8
+
+    class FailingOrchestrator(FakeOrchestrator):
+        def create_task(self, **kwargs):
+            raise RuntimeError("Ошибка создания")
+
+    monkeypatch.setattr(cli, "Orchestrator", FailingOrchestrator)
+    with pytest.raises(RuntimeError, match="Ошибка создания"):
+        cli.cmd_submit(args)
+    assert len(closed) == 9
 
 
 def test_orchestrator_retry_semantic_counts(

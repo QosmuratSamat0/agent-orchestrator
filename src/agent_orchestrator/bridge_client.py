@@ -3,8 +3,10 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import os
 import queue
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -20,8 +22,11 @@ class BridgeError(Exception):
 class BridgeClient:
     """Client for Agent-Bridge via stdio JSON-RPC MCP server protocol."""
 
-    def __init__(self, command: str | List[str] = "agent-bridge"):
+    def __init__(self, command: str | List[str] = "agent-bridge", close_grace_sec: float = 5.0):
         self.command = command
+        self.close_grace_sec = close_grace_sec
+        self.restart_count = 0
+        self._ever_started = False
         self.proc: Optional[subprocess.Popen] = None
         self._msg_id = 0
         self._stdout_queue: queue.Queue[Tuple[Optional[str], Optional[Exception]]] = queue.Queue()
@@ -53,8 +58,6 @@ class BridgeClient:
                 return
             for line in iter(proc.stdout.readline, ""):
                 q.put((line, None))
-                if stop_ev.is_set():
-                    break
         except Exception as e:
             q.put((None, e))
         finally:
@@ -70,9 +73,7 @@ class BridgeClient:
             if proc.stderr is None:
                 return
             for line in iter(proc.stderr.readline, ""):
-                buf.append(line.rstrip("\r\n"))
-                if stop_ev.is_set():
-                    break
+                buf.append(line.rstrip("\r\n")[:4000])
         except Exception:
             pass
 
@@ -81,28 +82,43 @@ class BridgeClient:
 
     def _cleanup_process(self) -> None:
         self._stop_event.set()
-        if self.proc:
-            for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+        proc = self.proc
+        if proc:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=self.close_grace_sec)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if os.name == "nt":
+                            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                           capture_output=True, timeout=10, check=False)
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        logger.warning("Не удалось завершить дерево Agent-Bridge PID %s: %s", proc.pid, exc)
+            except OSError as exc:
+                logger.warning("Ошибка при ожидании Agent-Bridge PID %s: %s", proc.pid, exc)
+            for pipe in (proc.stdout, proc.stderr):
                 if pipe:
                     try:
                         pipe.close()
                     except Exception:
                         pass
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self.proc.kill()
-                    self.proc.wait(timeout=2)
-                except Exception:
-                    pass
             self.proc = None
 
         if self._stdout_thread and self._stdout_thread.is_alive():
-            self._stdout_thread.join(timeout=1.0)
+            self._stdout_thread.join(timeout=2.0)
         if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=1.0)
+            self._stderr_thread.join(timeout=2.0)
         self._stdout_thread = None
         self._stderr_thread = None
 
@@ -134,7 +150,7 @@ class BridgeClient:
             self._cleanup_process()
 
         cmd = self._resolve_command()
-        logger.info(f"Starting Agent-Bridge MCP server: {cmd}")
+        logger.info("Запуск MCP-сервера Agent-Bridge: %s", cmd)
         self._stop_event.clear()
         self._stdout_queue = queue.Queue()
         self._stderr_buffer = collections.deque(maxlen=200)
@@ -147,12 +163,19 @@ class BridgeClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}),
             )
         except Exception as e:
             raise BridgeError(
                 f"Failed to start Agent-Bridge process with command {cmd}: {e}"
             ) from e
+
+        if self._ever_started:
+            self.restart_count += 1
+            logger.warning("Agent-Bridge перезапущен: задачи прежнего процесса больше недоступны для ожидания и отмены.")
+        self._ever_started = True
 
         self._stdout_thread = threading.Thread(
             target=self._stdout_reader_worker,
@@ -288,6 +311,23 @@ class BridgeClient:
 
             if not isinstance(data, dict):
                 logger.warning(f"Non-dict JSON received from bridge: {data}")
+                continue
+
+            if "method" in data:
+                if "id" in data:
+                    reply: Dict[str, Any] = {"jsonrpc": "2.0", "id": data["id"]}
+                    if data["method"] == "ping":
+                        reply["result"] = {}
+                    else:
+                        reply["error"] = {"code": -32601, "message": "Method not found"}
+                    try:
+                        assert self.proc is not None and self.proc.stdin is not None
+                        self.proc.stdin.write(json.dumps(reply, ensure_ascii=False) + "\n")
+                        self.proc.stdin.flush()
+                    except (BrokenPipeError, OSError) as exc:
+                        raise BridgeError(f"Не удалось ответить на запрос Agent-Bridge: {exc}") from exc
+                else:
+                    logger.debug("Уведомление Agent-Bridge без ID: %s", data["method"])
                 continue
 
             if data.get("id") == req_id:

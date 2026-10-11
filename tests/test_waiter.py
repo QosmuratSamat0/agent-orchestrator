@@ -298,3 +298,77 @@ def test_waiter_total_timeout_sec_override(mock_bridge: MockBridgeClient):
     assert elapsed < 1.5
     assert "t_slow_override" in mock_bridge.cancelled_tasks
 
+
+@pytest.mark.parametrize("status", ["running", "queued"])
+def test_waiter_rejects_orphan_from_fallback(status):
+    class OrphanBridge(MockBridgeClient):
+        def wait_task(self, task_id, timeout_sec=180.0):
+            raise BridgeError("Прежний процесс завершился")
+
+        def check_task(self, task_id):
+            return {"ok": True, "status": status, "from_state": True}
+
+    bridge = OrphanBridge()
+    started = time.monotonic()
+    with pytest.raises(BridgeError, match="прежнему процессу Agent-Bridge"):
+        NonLLMWaiter(bridge=bridge, total_timeout_sec=10).wait_for_completion("orphan")
+    assert time.monotonic() - started < 2
+    assert bridge.cancelled_tasks == []
+
+
+def test_waiter_rejects_orphan_from_wait_and_accepts_terminal(mock_bridge):
+    mock_bridge.tasks_status_map["running"] = {"ok": True, "status": "running", "from_state": True}
+    mock_bridge.tasks_status_map["completed"] = {"ok": True, "status": "completed", "from_state": True}
+    waiter = NonLLMWaiter(bridge=mock_bridge, total_timeout_sec=5)
+    with pytest.raises(BridgeError, match="прежнему процессу"):
+        waiter.wait_for_completion("running")
+    assert waiter.wait_for_completion("completed")["from_state"] is True
+
+
+@pytest.mark.parametrize("source", ["wait", "check"])
+def test_orphan_response_with_ok_false_still_stops(source):
+    class Bridge(MockBridgeClient):
+        def wait_task(self, task_id, timeout_sec=180.0):
+            if source == "wait":
+                return {"ok": False, "status": "queued", "from_state": True}
+            raise BridgeError("Сбой ожидания")
+
+        def check_task(self, task_id):
+            return {"ok": False, "status": "running", "from_state": True}
+
+    with pytest.raises(BridgeError, match="прежнему процессу"):
+        NonLLMWaiter(bridge=Bridge(), total_timeout_sec=3).wait_for_completion("orphan")
+
+
+def test_terminal_from_state_in_fallback_returns_normally():
+    class Bridge(MockBridgeClient):
+        def wait_task(self, task_id, timeout_sec=180.0):
+            raise BridgeError("Сбой ожидания")
+
+        def check_task(self, task_id):
+            return {"ok": True, "status": "completed", "from_state": True}
+
+    result = NonLLMWaiter(bridge=Bridge(), total_timeout_sec=3).wait_for_completion("done")
+    assert result["status"] == "completed" and result["from_state"] is True
+
+
+def test_fallback_running_uses_exponential_backoff():
+    class FallbackBridge(MockBridgeClient):
+        def __init__(self):
+            super().__init__()
+            self.check_calls = 0
+
+        def wait_task(self, task_id, timeout_sec=180.0):
+            raise BridgeError("Временный сбой ожидания")
+
+        def check_task(self, task_id):
+            self.check_calls += 1
+            return {"ok": True, "status": "running"}
+
+    bridge = FallbackBridge()
+    waiter = NonLLMWaiter(bridge=bridge, total_timeout_sec=4,
+                          base_backoff_sec=0.5, max_backoff_sec=2)
+    with pytest.raises(TaskTimeoutError):
+        waiter.wait_for_completion("fallback")
+    assert bridge.check_calls <= 6
+
