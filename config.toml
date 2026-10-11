@@ -1,0 +1,30 @@
+# Конфигурация Agent Orchestrator
+
+[orchestrator]
+db_path = "orchestrator.sqlite"
+max_active_tasks = 1
+total_task_timeout_sec = 2700.0
+
+[bridge]
+command = "agent-bridge"
+wait_chunk_sec = 60.0
+stall_timeout_sec = 1800.0
+
+[codex]
+command = "C:\\Users\\admin\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe"
+exec_timeout_sec = 300.0
+sandbox_mode = "workspace-write"
+skip_git_repo_check = true
+ephemeral = true
+
+[antigravity]
+command = "C:\\Users\\admin\\AppData\\Local\\agy\\bin\\agy.exe"
+default_effort = "medium"
+
+[models]
+trivial = "gemini-3.8-flash-low"
+simple = "gemini-3.8-flash-low"
+moderate = "gemini-3.8-flash-high"
+complex = "gemini-3.1-pro-high"
+expert = "gemini-3.1-pro-high"
+fallback = "gemini-3.8-flash-high"

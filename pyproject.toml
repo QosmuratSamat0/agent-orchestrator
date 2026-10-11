@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-orchestrator"
+version = "0.1.0"
+description = "Локальный Python-оркестратор Codex CLI и Antigravity CLI через Agent-Bridge"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Lead Developer", email = "dev@example.com" }
+]
+dependencies = []
+
+[project.scripts]
+agent-orchestrator = "agent_orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Test / tool caches
+.pytest_cache/
+
+# Runtime data (task prompts and history live here, keep private)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Generated reports
+orchestrator_report_*.md
+
+# Personal Claude Code files
+CLAUDE.local.md
+.claude/settings.local.json
