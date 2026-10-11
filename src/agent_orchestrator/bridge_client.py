@@ -83,6 +83,11 @@ class BridgeClient:
     def _cleanup_process(self) -> None:
         self._stop_event.set()
         proc = self.proc
+        deadline = time.monotonic() + max(0.0, self.close_grace_sec) + 9.5
+
+        def remaining(limit: float) -> float:
+            return min(limit, max(0.0, deadline - time.monotonic()))
+
         if proc:
             if proc.stdin:
                 try:
@@ -90,35 +95,60 @@ class BridgeClient:
                 except Exception:
                     pass
             try:
-                proc.wait(timeout=self.close_grace_sec)
+                proc.wait(timeout=max(0.0, self.close_grace_sec))
             except subprocess.TimeoutExpired:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
+                if os.name == "nt":
                     try:
-                        if os.name == "nt":
-                            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                                           capture_output=True, timeout=10, check=False)
-                        else:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait(timeout=2)
+                        killed = subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            capture_output=True, timeout=remaining(3), check=False,
+                        )
+                        if killed.returncode != 0:
+                            logger.warning("Не удалось завершить дерево Agent-Bridge PID %s: %s", proc.pid,
+                                           killed.stderr.decode("utf-8", errors="replace").strip())
                     except (OSError, subprocess.TimeoutExpired) as exc:
                         logger.warning("Не удалось завершить дерево Agent-Bridge PID %s: %s", proc.pid, exc)
+                    try:
+                        proc.wait(timeout=remaining(5))
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=remaining(1))
+                        except (OSError, subprocess.TimeoutExpired) as exc:
+                            logger.warning("Не удалось завершить Agent-Bridge PID %s: %s", proc.pid, exc)
+                else:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=remaining(3))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=remaining(2))
+                    except subprocess.TimeoutExpired:
+                        logger.warning("Не удалось завершить Agent-Bridge PID %s", proc.pid)
             except OSError as exc:
                 logger.warning("Ошибка при ожидании Agent-Bridge PID %s: %s", proc.pid, exc)
-            for pipe in (proc.stdout, proc.stderr):
-                if pipe:
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
-            self.proc = None
 
-        if self._stdout_thread and self._stdout_thread.is_alive():
-            self._stdout_thread.join(timeout=2.0)
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=2.0)
+        for thread, pipe in ((self._stdout_thread, proc.stdout if proc else None),
+                             (self._stderr_thread, proc.stderr if proc else None)):
+            if thread and thread.is_alive():
+                thread.join(timeout=remaining(2))
+            if thread and thread.is_alive():
+                logger.warning("Поток чтения Agent-Bridge PID %s не завершился; pipe оставлен открытым",
+                               proc.pid if proc else "?")
+            elif pipe:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        self.proc = None
         self._stdout_thread = None
         self._stderr_thread = None
 

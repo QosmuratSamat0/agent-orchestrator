@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ if os.environ.get("FAKE_STUBBORN"):
 while True:
     line = sys.stdin.readline()
     if not line:
+        if os.environ.get("FAKE_EOF_CHILD"):
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                     stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+            Path(os.environ["FAKE_CHILD_PID"]).write_text(str(child.pid), encoding="ascii")
         if os.environ.get("FAKE_STUBBORN"):
             while True:
                 time.sleep(60)
@@ -445,6 +450,29 @@ def test_graceful_close_after_eof(mini_mcp_server: Path, tmp_path: Path, monkeyp
     assert proc.poll() is not None
     client.close()
     BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)]).close()
+
+
+def test_clean_parent_exit_with_child_holding_stdout_is_bounded(mini_mcp_server: Path, tmp_path: Path, monkeypatch):
+    pid_file = tmp_path / "child.pid"
+    monkeypatch.setenv("FAKE_EOF_CHILD", "1")
+    monkeypatch.setenv("FAKE_CHILD_PID", str(pid_file))
+    client = BridgeClient(command=[sys.executable, "-u", str(mini_mcp_server)], close_grace_sec=0.5)
+    child_pid = None
+    try:
+        client.connect()
+        parent = client.proc
+        started = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - started
+        child_pid = int(pid_file.read_text(encoding="ascii"))
+        assert parent.poll() is not None
+        assert elapsed < client.close_grace_sec + 10
+    finally:
+        client.close()
+        if child_pid is None and pid_file.exists():
+            child_pid = int(pid_file.read_text(encoding="ascii"))
+        if child_pid is not None:
+            os.kill(child_pid, signal.SIGTERM)
 
 
 def test_crash_then_automatic_restart(mini_mcp_server: Path):
