@@ -17,6 +17,7 @@ from agent_orchestrator.models import (
     VerificationVerdict,
 )
 from agent_orchestrator.model_router import ModelRouter
+from agent_orchestrator.progress import ProgressFeed
 from agent_orchestrator.repository import ConcurrencyLimitError, TaskRepository
 from agent_orchestrator.retry_controller import RetryController
 from agent_orchestrator.statuses import classify_bridge_status
@@ -49,6 +50,7 @@ class Orchestrator:
         retry_controller: Optional[RetryController] = None,
         waiter: Optional[NonLLMWaiter] = None,
         clock: Callable[[], float] = time.time,
+        progress: Optional[ProgressFeed] = None,
     ):
         self.config = config or OrchestratorConfig.load()
         self.clock = clock
@@ -66,11 +68,42 @@ class Orchestrator:
             agy_bin=self.config.antigravity.command,
         )
         self.retry_controller = retry_controller or RetryController()
+        self.progress = progress
+        if self.progress is None and self.config.progress.enabled:
+            log_dir = self.config.progress.log_dir or str(
+                Path(self.repo.db_path).parent / "orchestrator_logs"
+            )
+            self.progress = ProgressFeed(
+                log_dir=Path(log_dir),
+                poll_interval_sec=self.config.progress.poll_interval_sec,
+            )
         self.waiter = waiter or NonLLMWaiter(
             bridge=self.bridge,
-            wait_chunk_sec=self.config.bridge.wait_chunk_sec,
+            wait_chunk_sec=(
+                min(self.config.bridge.wait_chunk_sec, self.config.progress.poll_interval_sec)
+                if self.progress and self.progress.enabled
+                else self.config.bridge.wait_chunk_sec
+            ),
             total_timeout_sec=self.config.total_task_timeout_sec,
         )
+
+    def _log_progress(self, task: Task, message: str) -> None:
+        if self.progress:
+            try:
+                self.progress.log(task, message)
+            except Exception:
+                logger.debug("Не удалось записать прогресс задачи", exc_info=True)
+
+    def _wait_progress(self, task: Task, resp: dict, deadline: float) -> None:
+        if self.progress:
+            try:
+                self.progress.on_wait_progress(task, self.bridge, resp, deadline_epoch=deadline)
+            except Exception:
+                logger.debug("Не удалось обработать прогресс ожидания", exc_info=True)
+
+    def _progress_final(self, task: Task) -> Task:
+        self._log_progress(task, f"Итоговый статус: {task.status.value}")
+        return task
 
     def _cancelled_task(self, task_id: str, bridge_task_id: Optional[str] = None) -> Optional[Task]:
         current = self.repo.get_task(task_id)
@@ -142,7 +175,7 @@ class Orchestrator:
 
         if task.status.is_terminal:
             logger.info(f"Task {task.id} is already in terminal state: {task.status.value}")
-            return task
+            return self._progress_final(task)
 
         if isinstance(resume, bool):
             resume = "wait" if resume else None
@@ -182,7 +215,7 @@ class Orchestrator:
         while True:
             cancelled = self._cancelled_task(task.id, task.bridge_task_id)
             if cancelled:
-                return cancelled
+                return self._progress_final(cancelled)
             remaining = deadline - self.clock()
             if remaining <= 0:
                 phase = (
@@ -228,9 +261,12 @@ class Orchestrator:
 
                 cancelled = self._cancelled_task(task.id, task.bridge_task_id)
                 if cancelled:
-                    return cancelled
+                    return self._progress_final(cancelled)
 
                 try:
+                    self._log_progress(
+                        task, f"Отправка попытки {task.retry_count + 1}, модель {task.model}"
+                    )
                     dispatch_resp = self.bridge.dispatch_task(
                         agent="antigravity",
                         message=current_prompt,
@@ -244,24 +280,24 @@ class Orchestrator:
                 except Exception as e:
                     cancelled = self._cancelled_task(task.id)
                     if cancelled:
-                        return cancelled
+                        return self._progress_final(cancelled)
                     err_msg = f"Failed to dispatch task to Agent-Bridge: {e}"
                     logger.error(err_msg)
                     task.mark_failed(err_msg)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "DISPATCH_FAILED", {"error": str(e)})
-                    return task
+                    return self._progress_final(task)
 
                 bridge_task_id = dispatch_resp.get("task_id")
                 cancelled = self._cancelled_task(task.id, bridge_task_id)
                 if cancelled:
-                    return cancelled
+                    return self._progress_final(cancelled)
                 session_id = dispatch_resp.get("session_id")
                 if not bridge_task_id:
                     err_msg = f"Agent-Bridge dispatch did not return a task_id: {dispatch_resp}"
                     task.mark_failed(err_msg)
                     self.repo.update_task(task)
-                    return task
+                    return self._progress_final(task)
 
                 task.bridge_task_id = bridge_task_id
                 if session_id:
@@ -291,11 +327,16 @@ class Orchestrator:
                         bridge_task_id,
                         total_timeout_sec=remaining_for_wait,
                         should_cancel=lambda: self._cancelled_task(task.id) is not None,
+                        on_progress=(
+                            (lambda resp: self._wait_progress(task, resp, deadline))
+                            if self.progress
+                            else None
+                        ),
                     )
                 except TaskTimeoutError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return cancelled
+                        return self._progress_final(cancelled)
                     task.mark_timed_out(str(e))
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_TIMED_OUT", {"error": str(e)})
@@ -303,24 +344,24 @@ class Orchestrator:
                 except TaskCancelledError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return cancelled
+                        return self._progress_final(cancelled)
                     task.mark_cancelled(str(e))
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"error": str(e)})
-                    return task
+                    return self._progress_final(task)
                 except BridgeError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return cancelled
+                        return self._progress_final(cancelled)
                     task.mark_failed(f"Сбой Agent-Bridge: {e}")
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": str(e)})
-                    return task
+                    return self._progress_final(task)
 
                 # Check terminal state returned by waiter
                 cancelled = self._cancelled_task(task.id, bridge_task_id)
                 if cancelled:
-                    return cancelled
+                    return self._progress_final(cancelled)
                 bridge_status = classify_bridge_status(wait_result.get("status"))
 
                 if bridge_status == "cancelled":
@@ -332,21 +373,21 @@ class Orchestrator:
                     task.mark_cancelled(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"error": err_text})
-                    return task
+                    return self._progress_final(task)
 
                 if bridge_status == "failed":
                     err_text = wait_result.get("error") or "Antigravity reported failure."
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return task
+                    return self._progress_final(task)
 
                 if bridge_status != "completed":
                     err_text = f"Неожиданный статус завершения от Agent-Bridge: '{wait_result.get('status')}'"
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return task
+                    return self._progress_final(task)
 
             # Step 3: Collect Antigravity results & Git diff
             logger.info("Collecting Antigravity results from Agent-Bridge...")
@@ -355,7 +396,7 @@ class Orchestrator:
                 if not res_payload.get("ok", True):
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return cancelled
+                        return self._progress_final(cancelled)
                     err_text = (
                         "Не удалось получить результат задачи из Agent-Bridge: "
                         f"{res_payload.get('error') or 'Bridge вернул ok=false.'}"
@@ -363,7 +404,7 @@ class Orchestrator:
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return task
+                    return self._progress_final(task)
                 task.antigravity_result = (
                     res_payload.get("result_text") or str(res_payload)
                 )
@@ -374,7 +415,7 @@ class Orchestrator:
             task.git_diff = self.verifier.capture_git_diff(task.cwd)
             cancelled = self._cancelled_task(task.id, bridge_task_id)
             if cancelled:
-                return cancelled
+                return self._progress_final(cancelled)
             self.repo.update_task(task)
             self.repo.record_event(
                 task.id,
@@ -386,6 +427,7 @@ class Orchestrator:
                     ),
                 },
             )
+            self._log_progress(task, "Работа Antigravity завершена")
 
             # Step 4: Run Codex Verifier
             logger.info(f"[{attempt_label}] Launching Codex Verifier process...")
@@ -393,6 +435,7 @@ class Orchestrator:
                 on_step_callback(f"verifying_codex_{task.retry_count + 1}", task)
 
             remaining_for_verify = max(1.0, deadline - self.clock())
+            self._log_progress(task, "Проверка начата")
             verification = self.verifier.verify(
                 original_prompt=task.prompt,
                 acceptance_criteria=task.acceptance_criteria,
@@ -403,7 +446,7 @@ class Orchestrator:
             )
             cancelled = self._cancelled_task(task.id, bridge_task_id)
             if cancelled:
-                return cancelled
+                return self._progress_final(cancelled)
             last_verification = verification
             task.verification_verdict = verification.verdict
             task.verification_feedback = verification.feedback
@@ -417,6 +460,10 @@ class Orchestrator:
                     "exit_code": verification.exit_code,
                     "issues_count": len(verification.issues_found),
                 },
+            )
+            self._log_progress(
+                task,
+                f"Вердикт: {verification.verdict.value}; {verification.feedback[:150]}",
             )
 
             # Step 5: Decision based on verdict
@@ -460,6 +507,7 @@ class Orchestrator:
                     "RETRY_INITIATED",
                     {"next_attempt": task.retry_count + 1},
                 )
+                self._log_progress(task, f"Повторная попытка {task.retry_count + 1} начата")
                 continue
             else:  # FAILED
                 logger.error(f"Codex Verifier rejected changes as FAILED: {verification.feedback}")
@@ -480,7 +528,7 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Could not write report file to disk: {e}")
 
-        return task
+        return self._progress_final(task)
 
     def recover(self) -> List[Task]:
         """Detects interrupted tasks after orchestrator crash/restart and restores lifecycle."""

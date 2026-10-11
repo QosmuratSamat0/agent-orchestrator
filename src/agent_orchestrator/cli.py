@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from agent_orchestrator.config import OrchestratorConfig
 from agent_orchestrator.models import Task, TaskStatus
 from agent_orchestrator.model_router import VERIFIED_AGY_MODELS
 from agent_orchestrator.orchestrator import Orchestrator
+from agent_orchestrator.repository import TaskRepository
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -49,6 +52,8 @@ def print_step(step: str, task: Task) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
+    if orchestrator.progress:
+        orchestrator.progress.echo = print
 
     print("=" * 60)
     print("🤖 AGENT ORCHESTRATOR - ЗАПУСК КООРДИНАЦИИ")
@@ -191,6 +196,58 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(report)
 
 
+def cmd_watch(args: argparse.Namespace) -> None:
+    config = OrchestratorConfig.load(args.config)
+    repo = TaskRepository(config.db_path)
+    log_dir = Path(config.progress.log_dir) if config.progress.log_dir else Path(config.db_path).parent / "orchestrator_logs"
+    log_position = 0
+    watched_id = args.task_id
+
+    try:
+        while True:
+            task = (
+                repo.get_task(watched_id)
+                if watched_id
+                else repo.get_active_task() or next(iter(repo.list_tasks(limit=1)), None)
+            )
+            if not task:
+                print("Задач нет." if not watched_id else "Задача не найдена.")
+                return
+            watched_id = task.id
+
+            remaining = "нет"
+            if task.started_at:
+                started = datetime.fromisoformat(task.started_at.replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                seconds = max(0, int(started.timestamp() + config.total_task_timeout_sec - time.time()))
+                remaining = f"{seconds // 60:02}:{seconds % 60:02}"
+
+            print(f"Задача: {task.title} ({task.id[:8]})")
+            print(f"Статус: {task.status.value} | Попытка: {task.retry_count + 1} | Осталось: {remaining}")
+            if task.verification_verdict:
+                print(f"Вердикт: {task.verification_verdict.value}")
+            print("Последние события:")
+            for event in repo.get_events(task.id)[-5:]:
+                print(f"  {event.created_at[11:19]} {event.event_type}")
+
+            log_path = log_dir / f"{task.id[:8]}.log"
+            if log_path.is_file():
+                if log_path.stat().st_size < log_position:
+                    log_position = 0
+                with log_path.open("r", encoding="utf-8") as stream:
+                    stream.seek(log_position)
+                    for line in stream:
+                        print(line.rstrip("\n"))
+                    log_position = stream.tell()
+
+            if args.once or task.status.is_terminal:
+                return
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("Просмотр остановлен.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agent-orchestrator",
@@ -241,6 +298,12 @@ def main() -> None:
     p_rep = subparsers.add_parser("report", help="Вывести диагностический отчёт задачи")
     p_rep.add_argument("task_id", help="ID задачи")
 
+    # watch
+    p_watch = subparsers.add_parser("watch", help="Смотреть ход выполнения задачи")
+    p_watch.add_argument("task_id", nargs="?", help="ID задачи (по умолчанию активная или последняя)")
+    p_watch.add_argument("--interval", type=float, default=2.0, metavar="SEC", help="Интервал обновления в секундах")
+    p_watch.add_argument("--once", action="store_true", help="Показать один снимок")
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
@@ -253,6 +316,7 @@ def main() -> None:
         "cancel": cmd_cancel,
         "models": cmd_models,
         "report": cmd_report,
+        "watch": cmd_watch,
     }
 
     cmd_fn = dispatch_table.get(args.command)

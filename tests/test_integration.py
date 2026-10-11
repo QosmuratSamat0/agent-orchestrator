@@ -27,7 +27,7 @@ def test_cli_models_command(capsys):
         sys.argv = orig_argv
 
 
-def test_cli_list_and_status(tmp_path: Path, capsys):
+def test_cli_list_and_status(tmp_path: Path, capsys, monkeypatch):
     db_file = tmp_path / "cli_test.sqlite"
     cfg = OrchestratorConfig(db_path=str(db_file))
     orchestrator = Orchestrator(config=cfg)
@@ -43,7 +43,7 @@ def test_cli_list_and_status(tmp_path: Path, capsys):
         sys.argv = ["agent-orchestrator", "status", t.id]
         # Monkeypatch config in cmd
         from agent_orchestrator import cli
-        cli.OrchestratorConfig.load = lambda *a, **k: cfg
+        monkeypatch.setattr(cli.OrchestratorConfig, "load", lambda *a, **k: cfg)
         cli.main()
         captured = capsys.readouterr()
         assert "CLI Test Task" in captured.out

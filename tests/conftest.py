@@ -43,6 +43,7 @@ class MockBridgeClient(BridgeClient):
         self.dispatched_tasks: List[Dict[str, Any]] = []
         self.tasks_status_map: Dict[str, Dict[str, Any]] = {}
         self.cancelled_tasks: List[str] = []
+        self.transcript_events: Dict[str, List[Dict[str, Any]]] = {}
         self._counter = 0
 
     def connect(self) -> None:
@@ -109,6 +110,14 @@ class MockBridgeClient(BridgeClient):
         if "from_state" in res:
             result["from_state"] = res["from_state"]
         return result
+
+    def get_transcript(
+        self, session_id: str, offset: int = 0, limit: int = 50,
+        kinds: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        events = self.transcript_events.get(session_id, [])
+        page = events[offset:offset + limit]
+        return {"ok": True, "events": page, "offset": offset, "next_offset": offset + len(page)}
 
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         self.cancelled_tasks.append(task_id)

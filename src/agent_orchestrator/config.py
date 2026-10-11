@@ -41,6 +41,13 @@ class ModelRoutingConfig:
 
 
 @dataclass
+class ProgressConfig:
+    enabled: bool = True
+    poll_interval_sec: float = 10.0
+    log_dir: str = ""
+
+
+@dataclass
 class OrchestratorConfig:
     db_path: str = "orchestrator.sqlite"
     max_active_tasks: int = 1
@@ -49,6 +56,7 @@ class OrchestratorConfig:
     codex: CodexConfig = field(default_factory=CodexConfig)
     antigravity: AntigravityConfig = field(default_factory=AntigravityConfig)
     models: ModelRoutingConfig = field(default_factory=ModelRoutingConfig)
+    progress: ProgressConfig = field(default_factory=ProgressConfig)
 
     @classmethod
     def load(cls, config_path: Optional[str | Path] = None) -> OrchestratorConfig:
@@ -121,5 +129,14 @@ class OrchestratorConfig:
                 config.models.expert = str(m["expert"])
             if "fallback" in m:
                 config.models.fallback = str(m["fallback"])
+
+        if "progress" in data:
+            progress = data["progress"]
+            if "enabled" in progress:
+                config.progress.enabled = bool(progress["enabled"])
+            if "poll_interval_sec" in progress:
+                config.progress.poll_interval_sec = float(progress["poll_interval_sec"])
+            if "log_dir" in progress:
+                config.progress.log_dir = str(progress["log_dir"])
 
         return config

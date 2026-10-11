@@ -17,6 +17,7 @@ dist/
 
 # Generated reports
 orchestrator_report_*.md
+orchestrator_logs/
 
 # Personal Claude Code files
 CLAUDE.local.md

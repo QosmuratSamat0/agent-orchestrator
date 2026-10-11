@@ -391,6 +391,18 @@ class BridgeClient:
     def check_task(self, task_id: str) -> Dict[str, Any]:
         return self.call_tool("check_task", {"task_id": task_id})
 
+    def get_transcript(
+        self,
+        session_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        kinds: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        args: Dict[str, Any] = {"session_id": session_id, "offset": offset, "limit": limit}
+        if kinds is not None:
+            args["kinds"] = kinds
+        return self.call_tool("get_transcript", args)
+
     def get_result(
         self, task_id: str, max_chars: int = 60000
     ) -> Dict[str, Any]:

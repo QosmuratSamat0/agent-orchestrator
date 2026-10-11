@@ -10,6 +10,11 @@ command = "agent-bridge"
 wait_chunk_sec = 60.0
 stall_timeout_sec = 1800.0
 
+# [progress]
+# enabled = true
+# poll_interval_sec = 10.0
+# log_dir = ""  # По умолчанию: orchestrator_logs рядом с файлом SQLite.
+
 [codex]
 command = "C:\\Users\\admin\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe"
 exec_timeout_sec = 300.0
