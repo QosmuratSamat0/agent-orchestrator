@@ -93,6 +93,7 @@ def test_verification_result_dict():
         issues_found=["Edge case missing"],
         tests_executed=True,
         tests_passed=False,
+        test_evidence="python -m pytest (код 1): 2 failed",
     )
     d = res.to_dict()
     restored = VerificationResult.from_dict(d)
@@ -101,3 +102,4 @@ def test_verification_result_dict():
     assert restored.issues_found == ["Edge case missing"]
     assert restored.tests_executed is True
     assert restored.tests_passed is False
+    assert restored.test_evidence == "python -m pytest (код 1): 2 failed"

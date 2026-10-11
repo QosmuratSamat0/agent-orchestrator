@@ -68,6 +68,7 @@ class VerificationResult:
     issues_found: List[str] = field(default_factory=list)
     tests_executed: bool = False
     tests_passed: bool = False
+    test_evidence: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -78,6 +79,7 @@ class VerificationResult:
             "issues_found": self.issues_found,
             "tests_executed": self.tests_executed,
             "tests_passed": self.tests_passed,
+            "test_evidence": self.test_evidence,
         }
 
     @classmethod
@@ -90,6 +92,7 @@ class VerificationResult:
             issues_found=data.get("issues_found", []),
             tests_executed=data.get("tests_executed", False),
             tests_passed=data.get("tests_passed", False),
+            test_evidence=data.get("test_evidence", ""),
         )
 
 

@@ -89,6 +89,7 @@ class RetryController:
                 f"- **Код возврата Codex:** `{last_verification.exit_code}`",
                 f"- **Тесты запускались:** {'Да' if last_verification.tests_executed else 'Нет'}",
                 f"- **Тесты пройдены:** {'Да' if last_verification.tests_passed else 'Нет'}",
+                f"- **Доказательство запуска тестов:** {last_verification.test_evidence or 'нет доказательств запуска тестов'}",
                 "",
                 "**Замечания верификатора:**",
                 "```",

@@ -87,6 +87,7 @@ def test_final_report_generation():
         raw_output="",
         tests_executed=True,
         tests_passed=True,
+        test_evidence="python -m pytest (код 0): 5 passed",
     )
 
     events = [
@@ -100,5 +101,6 @@ def test_final_report_generation():
     assert "gemini-3.8-flash-high" in report
     assert "- **Количество попыток / повторов:** 1" in report
     assert "Everything looks great" in report
+    assert "python -m pytest (код 0): 5 passed" in report
     assert "TASK_CREATED" in report
     assert "VERIFICATION_COMPLETED" in report

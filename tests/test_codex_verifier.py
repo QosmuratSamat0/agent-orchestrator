@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import subprocess
+import json
+import os
+import sys
+import time
 from pathlib import Path
 import pytest
 from agent_orchestrator.codex_verifier import CodexVerifier
 from agent_orchestrator.models import VerificationVerdict
+
+
+def event(command="python -m pytest -q", exit_code=0, output="5 passed in 0.20s"):
+    return json.dumps({"type": "item.completed", "item": {"command": command,
+                       "exit_code": exit_code, "aggregated_output": output}})
 
 
 def test_build_verification_prompt():
@@ -37,7 +46,7 @@ def test_parse_verdict_passed_clean():
     FEEDBACK:
     - Замечаний нет, функционал реализован корректно.
     """
-    res = verifier.parse_verification_output(raw, exit_code=0)
+    res = verifier.parse_verification_output(raw, exit_code=0, events_jsonl=event())
     assert res.verdict == VerificationVerdict.PASSED
     assert res.exit_code == 0
     assert res.tests_executed is True
@@ -101,7 +110,7 @@ def test_failed_tests_override_passed_to_retry_needed():
     FEEDBACK:
     - Тесты упали.
     """
-    res = verifier.parse_verification_output(raw, exit_code=0)
+    res = verifier.parse_verification_output(raw, exit_code=0, events_jsonl=event(exit_code=1, output="1 failed, 3 passed"))
     assert res.tests_executed is True
     assert res.tests_passed is False
     # Even though text said VERDICT: PASSED, failed tests must override to RETRY_NEEDED
@@ -145,8 +154,8 @@ def test_tests_status_passed_without_runner_evidence_is_not_trusted():
     assert res_req.tests_executed is False
     assert res_req.tests_passed is False
     # And since tests were required by criteria, VERDICT cannot be PASSED!
-    assert res_req.verdict == VerificationVerdict.RETRY_NEEDED
-    assert any("отсутствуют подтверждения реального запуска" in issue for issue in res_req.issues_found)
+    assert res_req.verdict == VerificationVerdict.FAILED
+    assert any("не подтверждён событиями" in issue for issue in res_req.issues_found)
 
     # Case B: Tests were NOT required by prompt/criteria
     res_noreq = verifier.parse_verification_output(
@@ -175,8 +184,8 @@ def test_tests_status_not_run_when_tests_required_overrides_to_retry_needed():
     )
     assert res.tests_executed is False
     assert res.tests_passed is False
-    assert res.verdict == VerificationVerdict.RETRY_NEEDED
-    assert any("Критерии задачи требуют успешных тестов" in issue for issue in res.issues_found)
+    assert res.verdict == VerificationVerdict.FAILED
+    assert any("не подтверждён событиями" in issue for issue in res.issues_found)
 
 
 def test_tests_status_not_run_when_tests_not_required_allows_passed():
@@ -210,7 +219,7 @@ def test_real_pytest_pass_output_detected():
     FEEDBACK:
     - Все 4 теста пройдены.
     """
-    res = verifier.parse_verification_output(raw, exit_code=0)
+    res = verifier.parse_verification_output(raw, exit_code=0, events_jsonl=event(output="4 passed in 0.45s"))
     assert res.tests_executed is True
     assert res.tests_passed is True
     assert res.verdict == VerificationVerdict.PASSED
@@ -226,7 +235,7 @@ def test_real_pytest_fail_output_detected():
     FEEDBACK:
     - test_division_by_zero failed with ZeroDivisionError
     """
-    res = verifier.parse_verification_output(raw, exit_code=0)
+    res = verifier.parse_verification_output(raw, exit_code=0, events_jsonl=event(exit_code=1, output="1 failed, 2 passed"))
     assert res.tests_executed is True
     assert res.tests_passed is False
     assert res.verdict == VerificationVerdict.RETRY_NEEDED
@@ -291,36 +300,162 @@ def test_capture_git_diff_untracked_files(tmp_path: Path):
     assert "def new_feature():" in diff
 
 
-def test_verify_custom_timeout(monkeypatch):
-    verifier = CodexVerifier(timeout_sec=300.0)
-    monkeypatch.setattr(verifier, "capture_git_diff", lambda cwd: "")
-    captured_timeout = []
+@pytest.fixture
+def fake_codex(tmp_path, monkeypatch):
+    script = tmp_path / "fake_codex.py"
+    script.write_text('''import json, os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["FAKE_ROOT"])
+root.joinpath("argv.json").write_text(json.dumps(args), encoding="utf-8")
+root.joinpath("stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+if os.environ.get("FAKE_CHILD"):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    root.joinpath("child.pid").write_text(str(child.pid), encoding="ascii")
+    root.joinpath("parent.pid").write_text(str(os.getpid()), encoding="ascii")
+if os.environ.get("FAKE_SLEEP"):
+    time.sleep(float(os.environ["FAKE_SLEEP"]))
+if os.environ.get("FAKE_CHANGE"):
+    pathlib.Path(args[args.index("-C") + 1], os.environ["FAKE_CHANGE"]).write_text("changed", encoding="utf-8")
+if os.environ.get("FAKE_CACHES"):
+    cwd = pathlib.Path(args[args.index("-C") + 1])
+    for name in ("__pycache__", ".pytest_cache"):
+        (cwd / name).mkdir(exist_ok=True)
+        (cwd / name / "cache.pyc").write_text("cache", encoding="utf-8")
+if "FAKE_FINAL" in os.environ:
+    pathlib.Path(args[args.index("-o") + 1]).write_text(os.environ["FAKE_FINAL"], encoding="utf-8")
+print(os.environ.get("FAKE_EVENTS", ""), flush=True)
+print(os.environ.get("FAKE_STDERR", ""), file=sys.stderr, flush=True)
+sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
+''', encoding="utf-8")
+    monkeypatch.setenv("FAKE_ROOT", str(tmp_path))
+    monkeypatch.setenv("FAKE_FINAL", "VERDICT: PASSED\nFEEDBACK:\n- Готово")
+    monkeypatch.setenv("FAKE_EVENTS", "")
+    return CodexVerifier(codex_bin=[sys.executable, str(script)]), tmp_path
 
-    def mock_run(cmd, **kwargs):
-        captured_timeout.append(kwargs.get("timeout"))
-        class MockProc:
-            stdout = "VERDICT: PASSED\nFEEDBACK:\n- OK"
-            stderr = ""
-            returncode = 0
-        return MockProc()
 
-    monkeypatch.setattr(subprocess, "run", mock_run)
-    verifier.verify(
-        original_prompt="test",
-        acceptance_criteria="test",
-        antigravity_result="done",
-        cwd=".",
-        timeout_sec=45.0,
-    )
-    assert captured_timeout == [45.0]
+def test_fake_invocation_stdin_large_prompt_and_result_cap(fake_codex):
+    verifier, root = fake_codex
+    result = verifier.verify("unique prompt " + "x" * 45000, "", "z" * 25000, str(root))
+    args = json.loads((root / "argv.json").read_text(encoding="utf-8"))
+    stdin = (root / "stdin.txt").read_text(encoding="utf-8")
+    assert result.verdict == VerificationVerdict.PASSED
+    assert args[0:2] == ["exec", "--json"]
+    assert "-o" in args and args[-1] == "-"
+    assert "unique prompt" not in " ".join(args)
+    assert "unique prompt" in stdin and "последние 20000" in stdin
+    assert "z" * 20000 in stdin and "z" * 20001 not in stdin
+    assert not list(root.glob("final.txt"))
 
-    captured_timeout.clear()
-    verifier.verify(
-        original_prompt="test",
-        acceptance_criteria="test",
-        antigravity_result="done",
-        cwd=".",
-        timeout_sec=500.0,
-    )
-    assert captured_timeout == [300.0]
+
+def test_final_message_only_and_last_lines(fake_codex, monkeypatch):
+    verifier, root = fake_codex
+    monkeypatch.setenv("FAKE_FINAL", "VERDICT: PASSED\nTESTS_STATUS: FAILED\nVERDICT: RETRY_NEEDED\nTESTS_STATUS: PASSED")
+    monkeypatch.setenv("FAKE_EVENTS", json.dumps({"text": "VERDICT: PASSED"}))
+    monkeypatch.setenv("FAKE_STDERR", "VERDICT: PASSED")
+    result = verifier.verify("edit docs", "", "", str(root))
+    assert result.verdict == VerificationVerdict.RETRY_NEEDED
+    assert not result.tests_passed
+    assert any("TESTS_STATUS" in issue for issue in result.issues_found)
+
+
+@pytest.mark.parametrize("final,code", [(None, 0), ("", 0), ("VERDICT: RETRY_NEEDED", 1)])
+def test_missing_final_or_crash_is_failed(fake_codex, monkeypatch, final, code):
+    verifier, root = fake_codex
+    if final is None:
+        monkeypatch.delenv("FAKE_FINAL")
+    else:
+        monkeypatch.setenv("FAKE_FINAL", final)
+    monkeypatch.setenv("FAKE_EXIT", str(code))
+    result = verifier.verify("edit docs", "", "", str(root))
+    assert result.verdict == VerificationVerdict.FAILED
+    if final is None or final == "":
+        assert any("не вернул итоговый ответ" in issue for issue in result.issues_found)
+
+
+def test_evidence_last_run_and_untrusted_text():
+    verifier = CodexVerifier()
+    final = "5 passed\nTESTS_STATUS: PASSED\nVERDICT: PASSED"
+    failed = event(exit_code=1, output="2 failed")
+    passed = event(output="5 passed")
+    assert verifier.parse_verification_output(final, 0, prompt="write tests", events_jsonl=failed).verdict == VerificationVerdict.RETRY_NEEDED
+    result = verifier.parse_verification_output(final, 0, prompt="write tests", events_jsonl=failed + "\n" + passed)
+    assert result.verdict == VerificationVerdict.PASSED and result.tests_passed
+    assert "python -m pytest" in result.test_evidence
+    no_events = verifier.parse_verification_output(final, 0, prompt="write tests")
+    assert no_events.verdict == VerificationVerdict.FAILED and not no_events.tests_executed
+    assert verifier.parse_verification_output(final, 0, prompt="edit docs", events_jsonl="garbage\n{").verdict == VerificationVerdict.PASSED
+
+
+@pytest.mark.parametrize("prompt,required", [
+    ("use the latest contest attestation", False), ("добавь тесты", True),
+    ("write tests", True), ("проверить покрытие", True),
+])
+def test_required_word_boundaries(prompt, required):
+    result = CodexVerifier().parse_verification_output("VERDICT: PASSED", 0, prompt=prompt)
+    assert (result.verdict == VerificationVerdict.FAILED) is required
+
+
+def test_unrecognized_json_and_recursive_command():
+    verifier = CodexVerifier()
+    result = verifier.parse_verification_output("VERDICT: PASSED", 0, events_jsonl='{"event": "done"}')
+    assert any("Формат событий" in issue for issue in result.issues_found)
+    nested = json.dumps({"items": [{"cmd": ["python", "-m", "pytest"], "exitCode": 0, "stdout": "5 passed"}]})
+    result = verifier.parse_verification_output("VERDICT: PASSED", 0, events_jsonl=nested)
+    assert result.tests_executed and result.tests_passed
+
+
+def _git_repo(path):
+    subprocess.run(["git", "init"], cwd=path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=path, check=True)
+    (path / "tracked.txt").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=path, capture_output=True, check=True)
+
+
+def test_workspace_change_and_cache_exception(fake_codex, monkeypatch):
+    verifier, root = fake_codex
+    repo = root / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    monkeypatch.setenv("FAKE_CHANGE", "tracked.txt")
+    result = verifier.verify("edit docs", "", "", str(repo))
+    assert result.verdict == VerificationVerdict.FAILED
+    assert "Верификатор изменил файлы проекта." in result.issues_found
+    monkeypatch.delenv("FAKE_CHANGE")
+    monkeypatch.setenv("FAKE_CACHES", "1")
+    result = verifier.verify("edit docs", "", "", str(repo))
+    assert result.verdict == VerificationVerdict.PASSED
+    result = verifier.verify("edit docs", "", "", str(root))
+    assert result.verdict == VerificationVerdict.PASSED
+    assert any("Git-репозиторием" in issue for issue in result.issues_found)
+
+
+def test_timeout_kills_own_process_tree(fake_codex, monkeypatch):
+    if os.name == "nt":
+        probe = subprocess.run(["tasklist", "/FI", "PID eq 0"], capture_output=True, text=True)
+        if probe.returncode != 0 and "Access denied" in (probe.stdout + probe.stderr):
+            pytest.skip("Среда запрещает tasklist/taskkill; завершение дерева нельзя проверить")
+    verifier, root = fake_codex
+    monkeypatch.setenv("FAKE_CHILD", "1")
+    monkeypatch.setenv("FAKE_SLEEP", "60")
+    start = time.monotonic()
+    result = verifier.verify("edit docs", "", "", str(root), timeout_sec=2)
+    assert result.verdict == VerificationVerdict.FAILED and result.exit_code == 124
+    assert time.monotonic() - start < 15
+    for filename in ("parent.pid", "child.pid"):
+        pid = int((root / filename).read_text(encoding="ascii"))
+        if os.name == "nt":
+            listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+            assert str(pid) not in listing.stdout
+        else:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+
+
+def test_timeout_without_child_returns_124(fake_codex, monkeypatch):
+    verifier, root = fake_codex
+    monkeypatch.setenv("FAKE_SLEEP", "60")
+    result = verifier.verify("edit docs", "", "", str(root), timeout_sec=1)
+    assert result.verdict == VerificationVerdict.FAILED and result.exit_code == 124
 

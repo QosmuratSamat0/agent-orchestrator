@@ -4,8 +4,12 @@ import logging
 import os
 import re
 import subprocess
+import hashlib
+import json
+import signal
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from agent_orchestrator.models import VerificationResult, VerificationVerdict
 
@@ -17,7 +21,7 @@ class CodexVerifier:
 
     def __init__(
         self,
-        codex_bin: str = r"C:\Users\admin\AppData\Local\OpenAI\Codex\bin\2e5e00daee91c61d\codex.exe",
+        codex_bin: str | Sequence[str] = r"C:\Users\admin\AppData\Local\OpenAI\Codex\bin\2e5e00daee91c61d\codex.exe",
         timeout_sec: float = 300.0,
         sandbox_mode: str = "workspace-write",
         skip_git_repo_check: bool = True,
@@ -90,6 +94,8 @@ class CodexVerifier:
         git_diff: str,
         attempt: int = 1,
     ) -> str:
+        if len(antigravity_result) > 20000:
+            antigravity_result = "[Отчёт Antigravity сокращён; показаны последние 20000 символов.]\n" + antigravity_result[-20000:]
         return f"""Ты — автоматический верификатор качества кода (Codex Verifier).
 Твоя задача — объективно проверить работу, выполненную агентом Antigravity (попытка {attempt}), выполнить валидацию изменений и вынести вердикт.
 
@@ -106,6 +112,7 @@ class CodexVerifier:
 {git_diff[:25000]}
 
 === ИНСТРУКЦИЯ ПО ВЕРИФИКАЦИИ ===
+Не изменяй файлы проекта: только читай их и запускай тесты.
 1. Изучи изменения на соответствие исходному заданию и критериям приёмки.
 2. Проверь наличие синтаксических ошибок, регрессий или пропущенных требований.
 3. Применимо к репозиторию запусти тесты (например, pytest или unittest) и зафиксируй их результат.
@@ -132,234 +139,199 @@ FEEDBACK:
         attempt: int = 1,
         timeout_sec: Optional[float] = None,
     ) -> VerificationResult:
-        effective_timeout = (
-            min(self.timeout_sec, timeout_sec)
-            if timeout_sec is not None
-            else self.timeout_sec
+        effective_timeout = min(self.timeout_sec, timeout_sec) if timeout_sec is not None else self.timeout_sec
+        before = self._workspace_fingerprint(cwd)
+        prompt = self.build_verification_prompt(
+            original_prompt, acceptance_criteria, antigravity_result,
+            self.capture_git_diff(cwd), attempt,
         )
-        logger.info(
-            f"Starting Codex verification for attempt {attempt} in {cwd} (timeout={effective_timeout}s)"
-        )
-        git_diff = self.capture_git_diff(cwd)
-        verification_prompt = self.build_verification_prompt(
-            original_prompt=original_prompt,
-            acceptance_criteria=acceptance_criteria,
-            antigravity_result=antigravity_result,
-            git_diff=git_diff,
-            attempt=attempt,
-        )
-
-        cmd: List[str] = [self.codex_bin, "exec"]
-        if self.skip_git_repo_check:
-            cmd.append("--skip-git-repo-check")
-        if self.ephemeral:
-            cmd.append("--ephemeral")
-        if self.sandbox_mode:
-            cmd.extend(["-s", self.sandbox_mode])
-        if cwd and os.path.exists(cwd):
-            cmd.extend(["-C", str(cwd)])
-
-        cmd.append(verification_prompt)
-
+        prefix = [self.codex_bin] if isinstance(self.codex_bin, str) else list(self.codex_bin)
         try:
-            logger.debug(f"Running Codex command: {' '.join(cmd[:5])} ...")
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=effective_timeout,
+            with tempfile.TemporaryDirectory() as temp_dir:
+                final_file = Path(temp_dir) / "final.txt"
+                cmd = prefix + ["exec", "--json", "-o", str(final_file)]
+                if self.skip_git_repo_check:
+                    cmd.append("--skip-git-repo-check")
+                if self.ephemeral:
+                    cmd.append("--ephemeral")
+                if self.sandbox_mode:
+                    cmd.extend(["-s", self.sandbox_mode])
+                if cwd and os.path.exists(cwd):
+                    cmd.extend(["-C", str(cwd)])
+                cmd.append("-")
+                options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", **options,
+                )
+                try:
+                    stdout, _stderr = proc.communicate(input=prompt, timeout=effective_timeout)
+                except subprocess.TimeoutExpired:
+                    self._kill_process_tree(proc.pid)
+                    try:
+                        proc.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.communicate(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            logger.warning("Каналы процесса %s не закрылись после остановки", proc.pid)
+                    return VerificationResult(
+                        verdict=VerificationVerdict.FAILED,
+                        feedback=f"Верификатор превысил лимит времени {effective_timeout} с.",
+                        exit_code=124, raw_output="TimeoutExpired",
+                        issues_found=["Превышен лимит времени проверки."],
+                    )
+                final_message = final_file.read_text(encoding="utf-8", errors="replace") if final_file.is_file() else ""
+            after = self._workspace_fingerprint(cwd)
+            result = self.parse_verification_output(
+                final_message, proc.returncode, acceptance_criteria, original_prompt,
+                stdout or "", before is not None and after is not None and before != after,
             )
-            raw_output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-            exit_code = proc.returncode
-
-            logger.info(
-                f"Codex verifier process exited with code {exit_code} (output length: {len(raw_output)})"
-            )
-            return self.parse_verification_output(
-                raw_output=raw_output,
-                exit_code=exit_code,
-                criteria=acceptance_criteria,
-                prompt=original_prompt,
-            )
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"Codex verifier timed out after {effective_timeout}s")
+            if before is None or after is None:
+                result.issues_found.append("Проверка изменений пропущена: каталог не является Git-репозиторием или Git недоступен.")
+            return result
+        except Exception as exc:
+            logger.exception("Не удалось выполнить верификатор")
             return VerificationResult(
                 verdict=VerificationVerdict.FAILED,
-                feedback=f"Codex verifier execution timed out after {effective_timeout} seconds.",
-                exit_code=124,
-                raw_output="TimeoutExpired",
-                issues_found=["Verification process timed out."],
-                tests_executed=False,
-                tests_passed=False,
+                feedback=f"Не удалось запустить верификатор: {exc}",
+                exit_code=1, raw_output=str(exc),
+                issues_found=[f"Ошибка запуска верификатора: {exc}"],
             )
-        except Exception as e:
-            logger.error(f"Failed to execute Codex verifier: {e}")
-            return VerificationResult(
-                verdict=VerificationVerdict.FAILED,
-                feedback=f"Failed to spawn Codex verifier: {e}",
-                exit_code=1,
-                raw_output=str(e),
-                issues_found=[f"Execution exception: {e}"],
-                tests_executed=False,
-                tests_passed=False,
-            )
+
+    @staticmethod
+    def _kill_process_tree(pid: int) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=10, check=False)
+            else:
+                os.killpg(pid, signal.SIGKILL)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Не удалось завершить дерево процесса %s: %s", pid, exc)
+
+    @staticmethod
+    def _workspace_fingerprint(cwd: str) -> str | None:
+        try:
+            repo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
+                                  capture_output=True, timeout=15)
+            if repo.returncode != 0 or repo.stdout.strip() != b"true":
+                return None
+            diff = subprocess.run(["git", "diff", "HEAD"], cwd=cwd,
+                                  capture_output=True, timeout=30, check=True).stdout
+            status = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                                    cwd=cwd, capture_output=True, timeout=15, check=True).stdout
+            untracked = []
+            for entry in status.split(b"\0"):
+                if not entry.startswith(b"?? "):
+                    continue
+                name = entry[3:].decode("utf-8", errors="replace").replace("\\", "/")
+                parts = name.split("/")
+                if any(part in {"__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"} for part in parts) or name.endswith(".pyc"):
+                    continue
+                untracked.append(name)
+            digest = hashlib.sha256(diff + b"\0" + "\0".join(sorted(untracked)).encode("utf-8"))
+            return digest.hexdigest()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Не удалось проверить изменения Git: %s", exc)
+            return None
+
+    @staticmethod
+    def _test_evidence(events_jsonl: str) -> tuple[bool, bool, bool, str, bool]:
+        commands = []
+        json_seen = False
+
+        def visit(value: object) -> None:
+            if isinstance(value, dict):
+                command = value.get("command", value.get("cmd"))
+                code = value.get("exit_code", value.get("exitCode"))
+                if isinstance(command, (str, list)) and code is not None:
+                    command_text = " ".join(map(str, command)) if isinstance(command, list) else command
+                    output = value.get("aggregated_output", value.get("output", value.get("formatted_output", "")))
+                    output = str(output or "")
+                    if value.get("stdout") is not None:
+                        output = "\n".join(filter(None, [output, str(value["stdout"]), str(value.get("stderr", ""))]))
+                    commands.append((command_text, code, output))
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for line in events_jsonl.splitlines():
+            try:
+                value = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict):
+                json_seen = True
+                visit(value)
+
+        pattern = re.compile(
+            r"\b(?:pytest|py\.test|unittest|tox|nox)\b|\b-m\s+(?:pytest|unittest)\b|"
+            r"\b(?:npm\s+(?:test|run\s+test)|yarn\s+test|pnpm\s+test|go\s+test|"
+            r"cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b", re.I,
+        )
+        runs = [(cmd, code, output) for cmd, code, output in commands if pattern.search(cmd)]
+        if not runs:
+            return False, False, False, "", json_seen and not commands
+        command, code, output = runs[-1]
+        failed = str(code) != "0" or bool(re.search(r"\b\d+\s+failed\b|\bFAILED\b|\berrors\s*=", output, re.I))
+        summaries = [line.strip() for line in output.splitlines()
+                     if re.search(r"\b\d+\s+passed\b|^OK\b|\bpassed\b|\bFAILED\b|\b\d+\s+failed\b|\berrors\s*=", line, re.I)]
+        passed = not failed and bool(summaries)
+        evidence = f"{command[:200]} (код {code}): {(summaries[-1] if summaries else 'нет итоговой строки')[:300]}"
+        return True, passed, failed, evidence, json_seen and not commands
 
     def parse_verification_output(
         self,
-        raw_output: str,
+        final_message: str,
         exit_code: int,
         criteria: str = "",
         prompt: str = "",
+        events_jsonl: str = "",
+        workspace_changed: bool = False,
     ) -> VerificationResult:
-        """Extracts structured verdict and actionable feedback from Codex output with strict quality checks."""
-        # 1. Search for explicit structured VERDICT: <PASSED|RETRY_NEEDED|FAILED>
-        verdict_match = re.search(
-            r"^\s*VERDICT:\s*(PASSED|RETRY_NEEDED|FAILED)\s*$",
-            raw_output,
-            re.MULTILINE | re.IGNORECASE,
-        )
-
-        # 2. Extract FEEDBACK block and individual bullet points
-        feedback = ""
+        raw_output = final_message + "\n--- events ---\n" + events_jsonl[-50000:]
         issues: List[str] = []
-        feedback_match = re.search(
-            r"FEEDBACK:\s*(.*)", raw_output, re.IGNORECASE | re.DOTALL
-        )
+        verdicts = re.findall(r"^\s*VERDICT:\s*(PASSED|RETRY_NEEDED|FAILED)\s*$", final_message, re.I | re.M)
+        statuses = re.findall(r"^\s*TESTS_STATUS:\s*(PASSED|FAILED|NOT_RUN)\s*$", final_message, re.I | re.M)
+        feedback_match = re.search(r"^\s*FEEDBACK:\s*([\s\S]*)", final_message, re.I | re.M)
+        feedback = feedback_match.group(1).strip() if feedback_match else final_message[-2000:].strip()
         if feedback_match:
-            feedback = feedback_match.group(1).strip()
             for line in feedback.splitlines():
-                line = line.strip()
-                if line.startswith(("-", "*", "•")) or re.match(r"^\d+\.", line):
-                    cleaned = re.sub(r"^[-*•\d.]\s*", "", line).strip()
-                    if cleaned:
-                        issues.append(cleaned)
-        else:
-            feedback = raw_output[-2000:].strip() if raw_output else ""
-
-        # 3. Determine if tests were explicitly required by criteria or prompt
-        full_req = f"{criteria} {prompt}".lower()
-        tests_required = any(
-            kw in full_req for kw in ["тест", "test", "pytest", "unittest", "тестирован", "coverage"]
-        )
-
-        # 4. Test execution analysis (strict, NOT relying merely on textual claims)
-        tests_executed = False
-        tests_passed = False
-
-        test_status_match = re.search(
-            r"^\s*TESTS_STATUS:\s*(PASSED|FAILED|NOT_RUN)\s*$",
-            raw_output,
-            re.MULTILINE | re.IGNORECASE,
-        )
-
-        # Real test runner patterns
-        has_runner_fail = bool(
-            re.search(
-                r"(=+\s*\d+\s+failed.*=+|\b\d+\s+failed\b|FAILED \(failures=\d+|FAILED \(errors=\d+|\bERRORS:\s*\d+)",
-                raw_output,
-                re.IGNORECASE,
-            )
-        )
-        has_runner_pass = bool(
-            re.search(
-                r"(=+\s*\d+\s+passed.*=+|\b\d+\s+passed\b|(?:\n|^)OK\s*(?:\(.*\))?$)",
-                raw_output,
-                re.MULTILINE | re.IGNORECASE,
-            )
-        )
-
-        if test_status_match:
-            ts = test_status_match.group(1).upper()
-            if ts == "PASSED":
-                # Do NOT rely solely on model's textual statement! Require real runner confirmation.
-                if has_runner_pass and not has_runner_fail:
-                    tests_executed = True
-                    tests_passed = True
-                elif has_runner_fail:
-                    tests_executed = True
-                    tests_passed = False
-                else:
-                    # Model claimed TESTS_STATUS: PASSED, but NO runner output was found!
-                    tests_executed = False
-                    tests_passed = False
-                    issues.append(
-                        "Заявлен TESTS_STATUS: PASSED, однако в выводе отсутствуют подтверждения реального запуска тестового раннера (pytest/unittest)."
-                    )
-            elif ts == "FAILED":
-                tests_executed = True
-                tests_passed = False
-            elif ts == "NOT_RUN":
-                tests_executed = False
-                tests_passed = False
-        elif has_runner_fail:
-            tests_executed = True
-            tests_passed = False
-        elif has_runner_pass:
-            tests_executed = True
-            tests_passed = True
-
-        # 5. Determine initial verdict
-        verdict: VerificationVerdict
-        if not verdict_match:
-            # STRICT REQUIREMENT: No explicit valid verdict MUST NEVER result in PASSED!
-            verdict = VerificationVerdict.FAILED
-            issues.append(
-                "Отсутствует явный валидный вердикт (VERDICT: PASSED | RETRY_NEEDED | FAILED)."
-            )
-            if not feedback:
-                feedback = "Верификатор не вернул явного валидного вердикта."
-        else:
-            parsed_v = verdict_match.group(1).upper()
-            if parsed_v == "PASSED":
-                verdict = VerificationVerdict.PASSED
-            elif parsed_v == "RETRY_NEEDED":
-                verdict = VerificationVerdict.RETRY_NEEDED
-            else:
-                verdict = VerificationVerdict.FAILED
-
-        # 6. STRICT INTEGRITY CHECKS:
-        # A) Non-zero exit code: Process failed or tool crashed. PASSED is FORBIDDEN.
+                cleaned = re.sub(r"^\s*(?:[-*•]|\d+\.)\s*", "", line)
+                if cleaned != line and cleaned:
+                    issues.append(cleaned)
+        executed, passed, failed, evidence, unrecognized = self._test_evidence(events_jsonl)
+        if unrecognized:
+            issues.append("Формат событий верификатора не распознан: команды не найдены.")
+        if statuses and statuses[-1].upper() == "PASSED" and not passed:
+            issues.append("Заявлен TESTS_STATUS: PASSED, но успешный запуск тестов не подтверждён событиями верификатора.")
+        tests_required = bool(re.search(
+            r"\b(?:test|tests|testing|pytest|unittest|coverage)\b|\b(?:тест\w*|покрыти\w*)\b",
+            f"{criteria} {prompt}", re.I,
+        ))
+        verdict = VerificationVerdict(verdicts[-1].lower()) if verdicts else VerificationVerdict.FAILED
+        if not verdicts:
+            issues.append("Отсутствует явный валидный вердикт (VERDICT: PASSED | RETRY_NEEDED | FAILED).")
+            if not final_message.strip():
+                issues.append("Верификатор не вернул итоговый ответ")
         if exit_code != 0:
-            if verdict == VerificationVerdict.PASSED:
-                logger.warning(
-                    f"Codex claimed PASSED in text, but process exited with non-zero code {exit_code}. Overriding to FAILED."
-                )
-                verdict = VerificationVerdict.FAILED
-                issues.append(
-                    f"Процесс верификатора завершился с кодом ошибки {exit_code} (PASSED аннулирован)."
-                )
-            elif verdict != VerificationVerdict.RETRY_NEEDED:
-                verdict = VerificationVerdict.FAILED
-                issues.append(f"Процесс верификатора завершился с кодом ошибки {exit_code}.")
-
-        # B) Failed tests: If tests executed and failed, PASSED is FORBIDDEN.
-        if tests_executed and not tests_passed:
-            if verdict == VerificationVerdict.PASSED:
-                logger.warning(
-                    "Codex claimed PASSED in text, but tests failed. Overriding to RETRY_NEEDED."
-                )
-                verdict = VerificationVerdict.RETRY_NEEDED
-                issues.append("Зафиксированы проваленные тесты. Вердикт переведён в RETRY_NEEDED.")
-
-        # C) Tests required by criteria/prompt, but NOT confirmed as passed:
-        if tests_required and not tests_passed:
-            if verdict == VerificationVerdict.PASSED:
-                logger.warning(
-                    "Task criteria required tests, but tests are not confirmed passed. Overriding to RETRY_NEEDED."
-                )
-                verdict = VerificationVerdict.RETRY_NEEDED
-                issues.append(
-                    "Критерии задачи требуют успешных тестов, но их запуск не подтверждён логами раннера. Вердикт переведён в RETRY_NEEDED."
-                )
-
+            verdict = VerificationVerdict.FAILED
+            issues.append(f"Процесс верификатора завершился с кодом ошибки {exit_code}.")
+        if workspace_changed:
+            verdict = VerificationVerdict.FAILED
+            issues.append("Верификатор изменил файлы проекта.")
+        if failed and verdict == VerificationVerdict.PASSED:
+            verdict = VerificationVerdict.RETRY_NEEDED
+            issues.append("Зафиксированы проваленные тесты. Вердикт переведён в RETRY_NEEDED.")
+        if tests_required and not passed and not failed and verdict in (VerificationVerdict.PASSED, VerificationVerdict.RETRY_NEEDED):
+            verdict = VerificationVerdict.FAILED
+            issues.append("Тесты требуются, но успешный запуск не подтверждён событиями верификатора.")
         return VerificationResult(
-            verdict=verdict,
-            feedback=feedback,
-            exit_code=exit_code,
-            raw_output=raw_output,
-            issues_found=issues,
-            tests_executed=tests_executed,
-            tests_passed=tests_passed,
+            verdict=verdict, feedback=feedback, exit_code=exit_code, raw_output=raw_output,
+            issues_found=issues, tests_executed=executed, tests_passed=passed,
+            test_evidence=evidence,
         )
