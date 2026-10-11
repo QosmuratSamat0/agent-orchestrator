@@ -352,6 +352,18 @@ class Orchestrator:
             logger.info("Collecting Antigravity results from Agent-Bridge...")
             try:
                 res_payload = self.bridge.get_result(bridge_task_id)
+                if not res_payload.get("ok", True):
+                    cancelled = self._cancelled_task(task.id, bridge_task_id)
+                    if cancelled:
+                        return cancelled
+                    err_text = (
+                        "Не удалось получить результат задачи из Agent-Bridge: "
+                        f"{res_payload.get('error') or 'Bridge вернул ok=false.'}"
+                    )
+                    task.mark_failed(err_text)
+                    self.repo.update_task(task)
+                    self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
+                    return task
                 task.antigravity_result = (
                     res_payload.get("result_text") or str(res_payload)
                 )
@@ -526,6 +538,20 @@ class Orchestrator:
                     )
                     recovered.append(self.run_task(task.id, resume="verify"))
                 elif bridge_status in ("running", "queued"):
+                    if status_resp.get("from_state"):
+                        task.mark_failed(
+                            "Задача принадлежит другому или предыдущему экземпляру Agent-Bridge; "
+                            "ожидание и отмена невозможны. Проверьте работу агента вручную "
+                            "перед повторным запуском."
+                        )
+                        self.repo.update_task(task)
+                        self.repo.record_event(
+                            task.id,
+                            "TASK_ORPHANED",
+                            {"bridge_task_id": task.bridge_task_id, "status": raw_status},
+                        )
+                        recovered.append(task)
+                        continue
                     logger.info(
                         f"Task {task.id} is still running in Bridge ({bridge_status}). Resuming wait..."
                     )

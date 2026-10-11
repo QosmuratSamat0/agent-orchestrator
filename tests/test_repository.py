@@ -37,12 +37,18 @@ def test_update_task(repo: TaskRepository):
 def test_update_task_cannot_overwrite_cancelled(repo: TaskRepository, stale_status):
     task = repo.create_task(Task(title="Отмена", prompt="Проверка"))
     stale = repo.get_task(task.id)
-    task.mark_cancelled("Отменено пользователем")
+    task.mark_cancelled("Отменено пользователем.")
     repo.update_task(task)
-    stale.status = stale_status
-    repo.update_task(stale)
-    assert repo.get_task(task.id).status == TaskStatus.CANCELLED
-    assert stale.status == TaskStatus.CANCELLED
+    original_finished_at = task.finished_at
+    if stale_status == TaskStatus.COMPLETED:
+        stale.mark_completed()
+    else:
+        stale.mark_running()
+    returned = repo.update_task(stale)
+    stored = repo.get_task(task.id)
+    assert stored.status == returned.status == TaskStatus.CANCELLED
+    assert stored.error_message == returned.error_message == "Отменено пользователем."
+    assert stored.finished_at == returned.finished_at == original_finished_at
 
 
 def test_update_task_can_complete_running(repo: TaskRepository):

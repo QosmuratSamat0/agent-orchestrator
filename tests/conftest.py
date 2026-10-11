@@ -100,12 +100,15 @@ class MockBridgeClient(BridgeClient):
 
     def get_result(self, task_id: str, max_chars: int = 60000) -> Dict[str, Any]:
         res = self.tasks_status_map.get(task_id, {})
-        return {
+        result = {
             "ok": True,
             "task_id": task_id,
             "result_text": res.get("result_text", "Result"),
             "files_changed": res.get("files_changed", []),
         }
+        if "from_state" in res:
+            result["from_state"] = res["from_state"]
+        return result
 
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         self.cancelled_tasks.append(task_id)

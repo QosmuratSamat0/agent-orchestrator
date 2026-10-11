@@ -165,7 +165,10 @@ class TaskRepository:
                     bridge_task_id = ?, bridge_session_id = ?, retry_count = ?,
                     max_retries = ?, current_attempt = ?, antigravity_result = ?,
                     git_diff = ?, verification_verdict = ?, verification_feedback = ?,
-                    error_message = ?, started_at = ?, finished_at = ?, updated_at = ?
+                    error_message = CASE WHEN status = ? THEN error_message ELSE ? END,
+                    started_at = ?,
+                    finished_at = CASE WHEN status = ? THEN finished_at ELSE ? END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -193,8 +196,10 @@ class TaskRepository:
                         else None
                     ),
                     task.verification_feedback,
+                    TaskStatus.CANCELLED.value,
                     task.error_message,
                     task.started_at,
+                    TaskStatus.CANCELLED.value,
                     task.finished_at,
                     task.updated_at,
                     task.id,
@@ -202,9 +207,13 @@ class TaskRepository:
             )
             if cursor.rowcount == 0:
                 raise RepositoryError(f"Task with ID {task.id} not found.")
-            task.status = TaskStatus(
-                conn.execute("SELECT status FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
-            )
+            stored = conn.execute(
+                "SELECT status, error_message, finished_at FROM tasks WHERE id = ?",
+                (task.id,),
+            ).fetchone()
+            task.status = TaskStatus(stored["status"])
+            task.error_message = stored["error_message"]
+            task.finished_at = stored["finished_at"]
             conn.commit()
         return task
 

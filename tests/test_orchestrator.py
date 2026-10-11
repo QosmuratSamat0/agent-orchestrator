@@ -849,5 +849,72 @@ def test_completion_write_cannot_overwrite_external_cancel(temp_db, tmp_path):
     assert repo.get_task(task.id).status == TaskStatus.CANCELLED
 
 
+@pytest.mark.parametrize("status", ["running", "queued"])
+def test_recover_orphaned_task_does_not_contact_owner(repo, tmp_path, status):
+    class OrphanedBridge(MockBridgeClient):
+        def __init__(self):
+            super().__init__()
+            self.wait_calls = 0
+
+        def wait_task(self, task_id, timeout_sec=180.0):
+            self.wait_calls += 1
+            raise AssertionError("Ожидание чужой задачи запрещено")
+
+    bridge = OrphanedBridge()
+    verifier = MockCodexVerifier()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    bridge.tasks_status_map[task.bridge_task_id] = {
+        "ok": True, "status": status, "from_state": True,
+    }
+
+    result = orchestrator.recover()[0]
+    assert result.status == repo.get_task(task.id).status == TaskStatus.FAILED
+    assert "ожидание и отмена невозможны" in result.error_message
+    assert "вручную" in result.error_message
+    orphaned = [e for e in repo.get_events(task.id) if e.event_type == "TASK_ORPHANED"]
+    assert len(orphaned) == 1
+    assert orphaned[0].payload == {"bridge_task_id": task.bridge_task_id, "status": status}
+    assert bridge.dispatched_tasks == []
+    assert bridge.wait_calls == 0
+    assert bridge.cancelled_tasks == []
+    assert verifier.verification_calls == []
+
+
+def test_recover_completed_from_state_retries_then_passes(repo, mock_bridge, mock_verifier, tmp_path):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    mock_bridge.tasks_status_map[task.bridge_task_id] = {
+        "ok": True, "status": "completed", "from_state": True, "result_text": "Готово",
+    }
+    assert mock_bridge.get_result(task.bridge_task_id)["from_state"] is True
+    mock_verifier.set_next_verdict(VerificationVerdict.RETRY_NEEDED, "Исправить тест")
+    mock_verifier.set_next_verdict(VerificationVerdict.PASSED)
+
+    assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
+    assert len(mock_bridge.dispatched_tasks) == 1
+    assert len(mock_verifier.verification_calls) == 2
+
+
+def test_recover_completed_from_state_without_result_fails(repo, mock_verifier, tmp_path):
+    class MissingResultBridge(MockBridgeClient):
+        def get_result(self, task_id, max_chars=60000):
+            return {"ok": False, "from_state": True, "error": "Результат недоступен"}
+
+    bridge = MissingResultBridge()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    bridge.tasks_status_map[task.bridge_task_id] = {
+        "ok": True, "status": "completed", "from_state": True,
+    }
+
+    result = orchestrator.recover()[0]
+    assert result.status == TaskStatus.FAILED
+    assert "Результат недоступен" in result.error_message
+    assert any(e.event_type == "TASK_FAILED" for e in repo.get_events(task.id))
+    assert mock_verifier.verification_calls == []
+    assert bridge.dispatched_tasks == []
+
+
 
 
