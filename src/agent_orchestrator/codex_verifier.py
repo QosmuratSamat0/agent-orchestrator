@@ -231,7 +231,19 @@ FEEDBACK:
                 if any(part in {"__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"} for part in parts) or name.endswith(".pyc"):
                     continue
                 untracked.append(name)
-            digest = hashlib.sha256(diff + b"\0" + "\0".join(sorted(untracked)).encode("utf-8"))
+            digest = hashlib.sha256(diff + b"\0")
+            for name in sorted(untracked):
+                file_path = Path(cwd) / name
+                digest.update(name.encode("utf-8") + b"\0")
+                if file_path.is_symlink():
+                    digest.update(os.readlink(file_path).encode("utf-8", errors="replace"))
+                    continue
+                size = file_path.stat().st_size
+                if size > 5 * 1024 * 1024:
+                    stat = file_path.stat()
+                    digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode("ascii"))
+                else:
+                    digest.update(hashlib.sha256(file_path.read_bytes()).digest())
             return digest.hexdigest()
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             logger.warning("Не удалось проверить изменения Git: %s", exc)
@@ -277,11 +289,37 @@ FEEDBACK:
         if not runs:
             return False, False, False, "", json_seen and not commands
         command, code, output = runs[-1]
-        failed = str(code) != "0" or bool(re.search(r"\b\d+\s+failed\b|\bFAILED\b|\berrors\s*=", output, re.I))
-        summaries = [line.strip() for line in output.splitlines()
-                     if re.search(r"\b\d+\s+passed\b|^OK\b|\bpassed\b|\bFAILED\b|\b\d+\s+failed\b|\berrors\s*=", line, re.I)]
-        passed = not failed and bool(summaries)
-        evidence = f"{command[:200]} (код {code}): {(summaries[-1] if summaries else 'нет итоговой строки')[:300]}"
+        lines = [line.strip() for line in output.splitlines()]
+        summary = ""
+        passed = False
+        summary_failed = False
+        if re.search(r"\b(?:pytest|py\.test)\b", command, re.I):
+            summaries = [line.strip("= ") for line in lines
+                         if re.match(r"^\s*=*\s*\d+\s+(?:passed|failed|errors?)\b", line, re.I)]
+            if summaries:
+                summary = summaries[-1]
+                counts = {kind.lower(): int(number) for number, kind in re.findall(
+                    r"\b(\d+)\s+(passed|failed|errors?)\b", summary, re.I)}
+                summary_failed = counts.get("failed", 0) > 0 or counts.get("error", 0) > 0 or counts.get("errors", 0) > 0
+                passed = counts.get("passed", 0) > 0 and not summary_failed
+        elif re.search(r"\bunittest\b", command, re.I):
+            summaries = [line for line in lines if re.fullmatch(r"OK(?:\s*\([^)]*\))?|FAILED\s*\([^)]*\)", line, re.I)]
+            if summaries:
+                summary = summaries[-1]
+                ran = re.findall(r"^Ran\s+(\d+)\s+tests?\b", output, re.I | re.M)
+                summary_failed = bool(re.match(r"FAILED\b", summary, re.I))
+                passed = bool(re.match(r"OK\b", summary, re.I)) and (not ran or int(ran[-1]) > 0)
+        else:
+            summaries = [line.strip("= ") for line in lines
+                         if re.match(r"^\s*=*\s*(?:tests?:\s*)?(?:\d+\s+passed|passed\b)", line, re.I)]
+            if summaries:
+                summary = summaries[-1]
+                summary_failed = any(int(number) > 0 for number in re.findall(
+                    r"\b(\d+)\s+(?:failed|errors?)\b", summary, re.I))
+                passed = not summary_failed
+        failed = str(code) != "0" or summary_failed
+        passed = str(code) == "0" and passed and not failed
+        evidence = f"{command[:200]} (код {code}): {(summary or 'нет итоговой строки')[:300]}"
         return True, passed, failed, evidence, json_seen and not commands
 
     def parse_verification_output(

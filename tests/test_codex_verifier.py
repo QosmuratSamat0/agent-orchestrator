@@ -304,10 +304,12 @@ def test_capture_git_diff_untracked_files(tmp_path: Path):
 def fake_codex(tmp_path, monkeypatch):
     script = tmp_path / "fake_codex.py"
     script.write_text('''import json, os, pathlib, subprocess, sys, time
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 args = sys.argv[1:]
 root = pathlib.Path(os.environ["FAKE_ROOT"])
 root.joinpath("argv.json").write_text(json.dumps(args), encoding="utf-8")
-root.joinpath("stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+root.joinpath("stdin.txt").write_text(sys.stdin.buffer.read().decode("utf-8"), encoding="utf-8")
 if os.environ.get("FAKE_CHILD"):
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     root.joinpath("child.pid").write_text(str(child.pid), encoding="ascii")
@@ -386,6 +388,47 @@ def test_evidence_last_run_and_untrusted_text():
     assert verifier.parse_verification_output(final, 0, prompt="edit docs", events_jsonl="garbage\n{").verdict == VerificationVerdict.PASSED
 
 
+@pytest.mark.parametrize("command,output", [
+    ("python -m pytest", "WARNING retry: connection failed, retrying\n5 passed in 0.12s"),
+    ("python -m pytest", "tests/test_x.py::test_login_failed_attempt PASSED\n5 passed in 0.12s"),
+    ("python -m pytest", "5 passed, 0 failed in 0.1s"),
+    ("python -m pytest", "==== 5 passed, 1 warning in 0.3s ===="),
+    ("python -m unittest", "Ran 3 tests in 0.001s\n\nOK"),
+])
+def test_successful_summary_ignores_incidental_failures(command, output):
+    result = CodexVerifier().parse_verification_output(
+        "VERDICT: PASSED", 0, prompt="write tests",
+        events_jsonl=event(command=command, output=output),
+    )
+    assert result.verdict == VerificationVerdict.PASSED
+    assert result.tests_executed and result.tests_passed
+    assert not any("проваленные тесты" in issue for issue in result.issues_found)
+
+
+@pytest.mark.parametrize("command,code,output", [
+    ("python -m pytest", 1, "5 passed"),
+    ("python -m pytest", 0, "==== 1 failed, 4 passed in 0.2s ===="),
+    ("python -m unittest", 0, "Ran 3 tests in 0.001s\nFAILED (failures=1)"),
+])
+def test_failed_summary_or_exit_code_overrides_passed(command, code, output):
+    result = CodexVerifier().parse_verification_output(
+        "VERDICT: PASSED", 0, prompt="write tests",
+        events_jsonl=event(command=command, exit_code=code, output=output),
+    )
+    assert result.verdict == VerificationVerdict.RETRY_NEEDED
+    assert result.tests_executed and not result.tests_passed
+
+
+def test_executed_without_summary_is_not_confirmed():
+    result = CodexVerifier().parse_verification_output(
+        "VERDICT: PASSED", 0, prompt="write tests",
+        events_jsonl=event(output="tests/test_x.py::test_example PASSED"),
+    )
+    assert result.verdict == VerificationVerdict.FAILED
+    assert result.tests_executed and not result.tests_passed
+    assert "нет итоговой строки" in result.test_evidence
+
+
 @pytest.mark.parametrize("prompt,required", [
     ("use the latest contest attestation", False), ("добавь тесты", True),
     ("write tests", True), ("проверить покрытие", True),
@@ -429,6 +472,23 @@ def test_workspace_change_and_cache_exception(fake_codex, monkeypatch):
     result = verifier.verify("edit docs", "", "", str(root))
     assert result.verdict == VerificationVerdict.PASSED
     assert any("Git-репозиторием" in issue for issue in result.issues_found)
+
+
+def test_fingerprint_tracks_untracked_content_and_ignores_caches(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    new_file = repo / "new_file.py"
+    new_file.write_text("first", encoding="utf-8")
+    before = CodexVerifier._workspace_fingerprint(str(repo))
+    new_file.write_text("other", encoding="utf-8")
+    after = CodexVerifier._workspace_fingerprint(str(repo))
+    assert before != after
+    for name in ("__pycache__", ".pytest_cache"):
+        folder = repo / name
+        folder.mkdir()
+        (folder / "cache.pyc").write_bytes(b"cache")
+    assert CodexVerifier._workspace_fingerprint(str(repo)) == after
 
 
 def test_timeout_kills_own_process_tree(fake_codex, monkeypatch):
