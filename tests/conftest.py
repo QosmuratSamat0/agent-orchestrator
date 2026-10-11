@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import faulthandler
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pytest
@@ -19,6 +21,18 @@ from agent_orchestrator.model_router import ModelRouter
 from agent_orchestrator.repository import TaskRepository
 from agent_orchestrator.retry_controller import RetryController
 from agent_orchestrator.waiter import NonLLMWaiter
+
+
+@pytest.fixture(autouse=True)
+def test_safety_guard(monkeypatch):
+    # Не обращаться к реальному agy при создании ModelRouter в тестах.
+    monkeypatch.setattr(ModelRouter, "_load_available_models_from_cli", lambda self: None)
+    timeout = float(os.environ.get("TEST_TIMEOUT_SEC", "180"))
+    faulthandler.dump_traceback_later(timeout, exit=True)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 class MockBridgeClient(BridgeClient):

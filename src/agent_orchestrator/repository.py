@@ -160,7 +160,8 @@ class TaskRepository:
                 """
                 UPDATE tasks SET
                     title = ?, prompt = ?, acceptance_criteria = ?, cwd = ?,
-                    status = ?, complexity = ?, model = ?, effort = ?, model_reason = ?,
+                    status = CASE WHEN status = ? THEN ? ELSE ? END,
+                    complexity = ?, model = ?, effort = ?, model_reason = ?,
                     bridge_task_id = ?, bridge_session_id = ?, retry_count = ?,
                     max_retries = ?, current_attempt = ?, antigravity_result = ?,
                     git_diff = ?, verification_verdict = ?, verification_feedback = ?,
@@ -172,6 +173,8 @@ class TaskRepository:
                     task.prompt,
                     task.acceptance_criteria,
                     task.cwd,
+                    TaskStatus.CANCELLED.value,
+                    TaskStatus.CANCELLED.value,
                     task.status.value,
                     task.complexity.value,
                     task.model,
@@ -199,6 +202,9 @@ class TaskRepository:
             )
             if cursor.rowcount == 0:
                 raise RepositoryError(f"Task with ID {task.id} not found.")
+            task.status = TaskStatus(
+                conn.execute("SELECT status FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
+            )
             conn.commit()
         return task
 

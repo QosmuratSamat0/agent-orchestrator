@@ -33,6 +33,27 @@ def test_update_task(repo: TaskRepository):
     assert fetched.antigravity_result == "Done partial"
 
 
+@pytest.mark.parametrize("stale_status", [TaskStatus.RUNNING, TaskStatus.COMPLETED])
+def test_update_task_cannot_overwrite_cancelled(repo: TaskRepository, stale_status):
+    task = repo.create_task(Task(title="Отмена", prompt="Проверка"))
+    stale = repo.get_task(task.id)
+    task.mark_cancelled("Отменено пользователем")
+    repo.update_task(task)
+    stale.status = stale_status
+    repo.update_task(stale)
+    assert repo.get_task(task.id).status == TaskStatus.CANCELLED
+    assert stale.status == TaskStatus.CANCELLED
+
+
+def test_update_task_can_complete_running(repo: TaskRepository):
+    task = repo.create_task(Task(title="Завершение", prompt="Проверка"))
+    task.mark_running()
+    repo.update_task(task)
+    task.mark_completed()
+    repo.update_task(task)
+    assert task.status == repo.get_task(task.id).status == TaskStatus.COMPLETED
+
+
 def test_concurrency_limit_enforced(repo: TaskRepository):
     task1 = Task(title="Task 1", prompt="Active 1")
     repo.create_task(task1, max_active=1)

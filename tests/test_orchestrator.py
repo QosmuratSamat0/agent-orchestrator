@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import time
+
+import pytest
 
 from agent_orchestrator.bridge_client import BridgeError
 from agent_orchestrator.config import OrchestratorConfig
 from agent_orchestrator.models import Task, TaskStatus, VerificationVerdict
 from agent_orchestrator.orchestrator import Orchestrator
+from agent_orchestrator.repository import TaskRepository
 from agent_orchestrator.waiter import (
     NonLLMWaiter,
     TaskCancelledError,
@@ -671,6 +675,178 @@ def test_orchestrator_verifier_gets_budget(
     timeout_passed = call.get("timeout_sec")
     assert timeout_passed is not None
     assert timeout_passed <= 2200.0
+
+
+def _stage3_interrupted(orchestrator, tmp_path, bridge_id="old_bridge_id"):
+    task = orchestrator.create_task("Восстановление", "Исправить задачу", cwd=str(tmp_path))
+    task.mark_running(bridge_task_id=bridge_id)
+    orchestrator.repo.update_task(task)
+    return task
+
+
+def test_recover_completed_retries_then_passes(repo, mock_bridge, mock_verifier, tmp_path):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    mock_bridge.tasks_status_map[task.bridge_task_id] = {"ok": True, "status": "completed"}
+    mock_verifier.set_next_verdict(VerificationVerdict.RETRY_NEEDED, "Исправить проверку типов")
+    mock_verifier.set_next_verdict(VerificationVerdict.PASSED)
+
+    assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
+    assert len(mock_bridge.dispatched_tasks) == 1
+    retry = mock_bridge.dispatched_tasks[0]
+    assert retry["request_id"] == f"{task.request_id}_1"
+    assert "Исправить проверку типов" in retry["message"]
+    assert len(mock_verifier.verification_calls) == 2
+
+
+@pytest.mark.parametrize("verdict,expected", [
+    (VerificationVerdict.FAILED, TaskStatus.FAILED),
+    (VerificationVerdict.PASSED, TaskStatus.COMPLETED),
+])
+def test_recover_completed_terminal_verdict(repo, mock_bridge, mock_verifier, tmp_path, verdict, expected):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    mock_bridge.tasks_status_map[task.bridge_task_id] = {"ok": True, "status": "completed"}
+    mock_verifier.set_next_verdict(verdict)
+    assert orchestrator.recover()[0].status == expected
+    assert mock_bridge.dispatched_tasks == []
+    assert len(mock_verifier.verification_calls) == 1
+
+
+def test_recover_retry_respects_deadline(repo, mock_bridge, tmp_path):
+    anchor = time.time()
+    ticks = iter(anchor + n * 1000 for n in range(20))
+    verifier = MockCodexVerifier(default_verdict=VerificationVerdict.RETRY_NEEDED)
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=verifier, clock=lambda: next(ticks))
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    mock_bridge.tasks_status_map[task.bridge_task_id] = {"ok": True, "status": "completed"}
+    assert orchestrator.recover()[0].status == TaskStatus.TIMED_OUT
+    assert repo.get_task(task.id).status == TaskStatus.TIMED_OUT
+    assert verifier.verification_calls
+
+
+def test_recover_running_retries_only_after_wait(repo, tmp_path):
+    class RunningBridge(MockBridgeClient):
+        def __init__(self):
+            super().__init__()
+            self.wait_calls = 0
+
+        def wait_task(self, task_id, timeout_sec=180.0):
+            self.wait_calls += 1
+            if self.wait_calls <= 3:
+                assert self.dispatched_tasks == []
+                return {"ok": True, "status": "running"}
+            return {"ok": True, "status": "completed"}
+
+    bridge = RunningBridge()
+    verifier = MockCodexVerifier()
+    verifier.set_next_verdict(VerificationVerdict.RETRY_NEEDED, "Исправить вывод")
+    verifier.set_next_verdict(VerificationVerdict.PASSED)
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    bridge.tasks_status_map[task.bridge_task_id] = {"ok": True, "status": "running"}
+    assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
+    assert bridge.wait_calls >= 4
+    assert len(bridge.dispatched_tasks) == 1
+    assert len(verifier.verification_calls) == 2
+
+
+def test_recover_dispatches_pending_retry_without_old_verification(repo, tmp_path):
+    verifier = MockCodexVerifier()
+
+    class AssertDispatchFirstBridge(MockBridgeClient):
+        def __init__(self):
+            super().__init__()
+            self.check_calls = 0
+
+        def dispatch_task(self, **kwargs):
+            assert verifier.verification_calls == []
+            return super().dispatch_task(**kwargs)
+
+        def check_task(self, task_id):
+            self.check_calls += 1
+            return super().check_task(task_id)
+
+    bridge = AssertDispatchFirstBridge()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    task.retry_count = 1
+    task.verification_feedback = "Исправить восстановление"
+    repo.update_task(task)
+    bridge.tasks_status_map[task.bridge_task_id] = {"ok": True, "status": "completed"}
+    repo.record_event(task.id, "TASK_DISPATCHED", {"attempt": 1})
+    repo.record_event(task.id, "VERIFICATION_COMPLETED", {"verdict": "retry_needed"})
+    repo.record_event(task.id, "RETRY_INITIATED", {"next_attempt": 2})
+
+    assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
+    assert bridge.check_calls == 0
+    assert len(bridge.dispatched_tasks) == 1
+    assert bridge.dispatched_tasks[0]["request_id"] == f"{task.request_id}_1"
+    assert "Исправить восстановление" in bridge.dispatched_tasks[0]["message"]
+    assert len(verifier.verification_calls) == 1
+
+
+def test_recover_missing_bridge_records_failure(repo, mock_bridge, mock_verifier, tmp_path):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    assert orchestrator.recover()[0].status == TaskStatus.FAILED
+    assert any(e.event_type == "TASK_FAILED" for e in repo.get_events(task.id))
+
+
+def test_recover_bridge_exception_records_failure(repo, mock_verifier, tmp_path):
+    class BrokenCheckBridge(MockBridgeClient):
+        def check_task(self, task_id):
+            raise RuntimeError("Bridge недоступен")
+
+    bridge = BrokenCheckBridge()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(orchestrator, tmp_path)
+    assert orchestrator.recover()[0].status == TaskStatus.FAILED
+    assert any(
+        e.event_type == "TASK_FAILED" and "Bridge недоступен" in e.payload["error"]
+        for e in repo.get_events(task.id)
+    )
+
+
+def test_recover_external_cancel_ignores_bridge_result(temp_db, tmp_path):
+    repo = TaskRepository(temp_db)
+    other_repo = TaskRepository(temp_db)
+    verifier = MockCodexVerifier()
+
+    class CancelOnCheck(MockBridgeClient):
+        def check_task(self, task_id):
+            other = other_repo.get_task(active.id)
+            other.mark_cancelled("Отменено пользователем")
+            other_repo.update_task(other)
+            return {"ok": True, "status": "completed"}
+
+    bridge = CancelOnCheck()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=verifier)
+    active = _stage3_interrupted(orchestrator, tmp_path)
+    assert orchestrator.recover()[0].status == TaskStatus.CANCELLED
+    assert repo.get_task(active.id).status == TaskStatus.CANCELLED
+    assert verifier.verification_calls == []
+
+
+def test_completion_write_cannot_overwrite_external_cancel(temp_db, tmp_path):
+    other_repo = TaskRepository(temp_db)
+
+    class CancelBeforeCompletion(TaskRepository):
+        def update_task(self, task):
+            if task.status == TaskStatus.COMPLETED:
+                other = other_repo.get_task(task.id)
+                other.mark_cancelled("Отменено пользователем")
+                other_repo.update_task(other)
+            return super().update_task(task)
+
+    repo = CancelBeforeCompletion(temp_db)
+    bridge = MockBridgeClient()
+    verifier = MockCodexVerifier()
+    orchestrator = Orchestrator(repository=repo, bridge=bridge, verifier=verifier)
+    task = orchestrator.create_task("Гонка", "Проверить", cwd=str(tmp_path))
+    result = orchestrator.run_task(task.id)
+    assert result.status == TaskStatus.CANCELLED
+    assert repo.get_task(task.id).status == TaskStatus.CANCELLED
 
 
 
