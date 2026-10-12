@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import pytest
 
 from agent_orchestrator.bridge_client import BridgeClient
 from agent_orchestrator.cli import cmd_watch
@@ -201,6 +202,9 @@ def test_external_cancel_wins_with_progress_enabled(tmp_path):
     assert runner.run_task(task.id).status == TaskStatus.CANCELLED
     assert runner.repo.get_task(task.id).status == TaskStatus.CANCELLED
     assert verifier.verification_calls == []
+    assert "Отменено пользователем." in (
+        tmp_path / f"orchestrator_report_{task.id[:8]}.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_watch_once_is_read_only_and_starts_no_processes(tmp_path, monkeypatch, capsys):
@@ -239,10 +243,44 @@ def test_watch_once_is_read_only_and_starts_no_processes(tmp_path, monkeypatch, 
 
 
 def test_watch_empty_database(tmp_path, capsys):
+    TaskRepository(tmp_path / "empty.sqlite")
     config_path = tmp_path / "config.toml"
     config_path.write_text(f'[orchestrator]\ndb_path = "{(tmp_path / "empty.sqlite").as_posix()}"\n', encoding="utf-8")
     cmd_watch(argparse.Namespace(config=str(config_path), task_id=None, interval=2.0, once=True))
     assert "Задач нет." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_watch_missing_database_exits_without_creating_it(tmp_path, capsys, missing_parent):
+    db_path = (tmp_path / "missing" if missing_parent else tmp_path) / "tasks.sqlite"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[orchestrator]\ndb_path = "{db_path.as_posix()}"\n', encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        cmd_watch(argparse.Namespace(config=str(config_path), task_id=None, interval=2.0, once=True))
+    assert error.value.code == 1
+    assert f"База данных не найдена: {db_path.resolve()}" in capsys.readouterr().out
+    assert not db_path.exists()
+
+
+def test_watch_terminal_remaining_and_local_event_time(tmp_path, capsys):
+    import sqlite3
+    from datetime import datetime, timezone
+
+    db_path = tmp_path / "tasks.sqlite"
+    repo = TaskRepository(db_path)
+    task = repo.create_task(Task(title="Завершено", prompt="Проверка", cwd=str(tmp_path)))
+    task.mark_completed()
+    repo.update_task(task)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                     ("2024-01-02T03:04:05+00:00", task.id))
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[orchestrator]\ndb_path = "{db_path.as_posix()}"\n', encoding="utf-8")
+    cmd_watch(argparse.Namespace(config=str(config_path), task_id=task.id, interval=2.0, once=True))
+    output = capsys.readouterr().out
+    expected = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc).astimezone().strftime("%H:%M:%S")
+    assert "Осталось: —" in output
+    assert expected in output
 
 
 def test_watch_tails_only_new_lines_until_terminal(tmp_path, monkeypatch, capsys):

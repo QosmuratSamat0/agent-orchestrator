@@ -177,8 +177,13 @@ def cmd_cancel(args: argparse.Namespace) -> None:
     orchestrator = Orchestrator(config=config)
     try:
 
-        task = orchestrator.cancel_task(args.task_id)
+        task = orchestrator.cancel_task(args.task_id, notify_bridge=False)
         print(f"Задача {task.id[:8]} переведена в статус: {task.status.value}")
+        print(
+            "Отмена записана в базе данных. Если оркестратор запущен, работа агента "
+            f"остановится примерно в течение {config.progress.poll_interval_sec} сек.; "
+            "иначе проверьте агента вручную."
+        )
     finally:
         orchestrator.close()
 
@@ -222,6 +227,10 @@ def cmd_report(args: argparse.Namespace) -> None:
 
 def cmd_watch(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
+    db_path = Path(config.db_path).resolve()
+    if not db_path.is_file():
+        print(f"База данных не найдена: {db_path}")
+        raise SystemExit(1)
     repo = TaskRepository(config.db_path)
     log_dir = Path(config.progress.log_dir) if config.progress.log_dir else Path(config.db_path).parent / "orchestrator_logs"
     log_position = 0
@@ -239,8 +248,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 return
             watched_id = task.id
 
-            remaining = "нет"
-            if task.started_at:
+            remaining = "—" if task.status.is_terminal else "нет"
+            if task.started_at and not task.status.is_terminal:
                 started = datetime.fromisoformat(task.started_at.replace("Z", "+00:00"))
                 if started.tzinfo is None:
                     started = started.replace(tzinfo=timezone.utc)
@@ -253,7 +262,10 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 print(f"Вердикт: {task.verification_verdict.value}")
             print("Последние события:")
             for event in repo.get_events(task.id)[-5:]:
-                print(f"  {event.created_at[11:19]} {event.event_type}")
+                event_time = datetime.fromisoformat(event.created_at.replace("Z", "+00:00"))
+                if event_time.tzinfo is None:
+                    event_time = event_time.replace(tzinfo=timezone.utc)
+                print(f"  {event_time.astimezone():%H:%M:%S} {event.event_type}")
 
             log_path = log_dir / f"{task.id[:8]}.log"
             if log_path.is_file():

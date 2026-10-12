@@ -10,6 +10,8 @@ from agent_orchestrator.cli import main
 from agent_orchestrator.config import OrchestratorConfig
 from agent_orchestrator.models import TaskStatus, VerificationVerdict
 from agent_orchestrator.orchestrator import Orchestrator
+from agent_orchestrator.repository import TaskRepository
+from agent_orchestrator.models import Task
 from tests.conftest import MockBridgeClient, MockCodexVerifier
 
 
@@ -50,6 +52,27 @@ def test_cli_list_and_status(tmp_path: Path, capsys, monkeypatch):
         assert t.id in captured.out
     finally:
         sys.argv = orig_argv
+
+
+def test_read_and_cancel_cli_do_not_start_router_or_subprocess(tmp_path, monkeypatch, capsys):
+    from agent_orchestrator import cli, orchestrator as module
+
+    cfg = OrchestratorConfig(db_path=str(tmp_path / "tasks.sqlite"))
+    repo = TaskRepository(cfg.db_path)
+    task = repo.create_task(Task(title="Задача", prompt="Проверить", cwd=str(tmp_path)))
+    monkeypatch.setattr(cli.OrchestratorConfig, "load", lambda *_, **__: cfg)
+    def forbidden(*_, **__):
+        raise AssertionError("Запуск процесса или маршрутизатора запрещён")
+    monkeypatch.setattr(module.ModelRouter, "__init__", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    for handler, task_id in ((cli.cmd_status, task.id), (cli.cmd_list, None),
+                             (cli.cmd_report, task.id), (cli.cmd_cancel, task.id)):
+        handler(__import__("argparse").Namespace(config=None, task_id=task_id, status=None))
+    output = capsys.readouterr().out
+    assert "Задача" in output
+    assert "Отмена записана в базе данных" in output
+    assert repo.get_task(task.id).status == TaskStatus.CANCELLED
 
 
 def test_real_sqlite_file_persistence_and_reload(tmp_path: Path):

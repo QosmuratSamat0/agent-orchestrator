@@ -218,7 +218,10 @@ FEEDBACK:
                                   capture_output=True, timeout=15)
             if repo.returncode != 0 or repo.stdout.strip() != b"true":
                 return None
-            diff = subprocess.run(["git", "diff", "HEAD"], cwd=cwd,
+            head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd,
+                                  capture_output=True, timeout=15)
+            diff_command = ["git", "diff", "HEAD"] if head.returncode == 0 else ["git", "diff"]
+            diff = subprocess.run(diff_command, cwd=cwd,
                                   capture_output=True, timeout=30, check=True).stdout
             status = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
                                     cwd=cwd, capture_output=True, timeout=15, check=True).stdout

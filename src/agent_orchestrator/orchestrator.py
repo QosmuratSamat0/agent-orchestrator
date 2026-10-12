@@ -63,10 +63,7 @@ class Orchestrator:
             skip_git_repo_check=self.config.codex.skip_git_repo_check,
             ephemeral=self.config.codex.ephemeral,
         )
-        self.router = router or ModelRouter(
-            config=self.config.models,
-            agy_bin=self.config.antigravity.command,
-        )
+        self._router = router
         self.retry_controller = retry_controller or RetryController()
         self.progress = progress
         if self.progress is None and self.config.progress.enabled:
@@ -107,8 +104,29 @@ class Orchestrator:
             except Exception:
                 logger.debug("Не удалось обработать прогресс ожидания", exc_info=True)
 
-    def _progress_final(self, task: Task) -> Task:
+    @property
+    def router(self) -> ModelRouter:
+        if self._router is None:
+            self._router = ModelRouter(
+                config=self.config.models,
+                agy_bin=self.config.antigravity.command,
+            )
+        return self._router
+
+    def _finish(
+        self, task: Task, last_verification: Optional[VerificationResult] = None
+    ) -> Task:
         self._log_progress(task, f"Итоговый статус: {task.status.value}")
+        try:
+            events = self.repo.get_events(task.id)
+            report_text = self.retry_controller.generate_final_report(
+                task, last_verification, events
+            )
+            report_path = Path(task.cwd) / f"orchestrator_report_{task.id[:8]}.md"
+            report_path.write_text(report_text, encoding="utf-8")
+            logger.info(f"Итоговый отчёт сохранён: {report_path}")
+        except Exception as e:
+            logger.warning(f"Не удалось записать итоговый отчёт задачи {task.id}: {e}")
         return task
 
     def _cancelled_task(self, task_id: str, bridge_task_id: Optional[str] = None) -> Optional[Task]:
@@ -181,7 +199,7 @@ class Orchestrator:
 
         if task.status.is_terminal:
             logger.info(f"Task {task.id} is already in terminal state: {task.status.value}")
-            return self._progress_final(task)
+            return self._finish(task)
 
         if isinstance(resume, bool):
             resume = "wait" if resume else None
@@ -221,7 +239,7 @@ class Orchestrator:
         while True:
             cancelled = self._cancelled_task(task.id, task.bridge_task_id)
             if cancelled:
-                return self._progress_final(cancelled)
+                return self._finish(cancelled, last_verification)
             remaining = deadline - self.clock()
             if remaining <= 0:
                 phase = (
@@ -267,7 +285,7 @@ class Orchestrator:
 
                 cancelled = self._cancelled_task(task.id, task.bridge_task_id)
                 if cancelled:
-                    return self._progress_final(cancelled)
+                    return self._finish(cancelled, last_verification)
 
                 try:
                     self._log_progress(
@@ -286,24 +304,24 @@ class Orchestrator:
                 except Exception as e:
                     cancelled = self._cancelled_task(task.id)
                     if cancelled:
-                        return self._progress_final(cancelled)
+                        return self._finish(cancelled, last_verification)
                     err_msg = f"Failed to dispatch task to Agent-Bridge: {e}"
                     logger.error(err_msg)
                     task.mark_failed(err_msg)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "DISPATCH_FAILED", {"error": str(e)})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
                 bridge_task_id = dispatch_resp.get("task_id")
                 cancelled = self._cancelled_task(task.id, bridge_task_id)
                 if cancelled:
-                    return self._progress_final(cancelled)
+                    return self._finish(cancelled, last_verification)
                 session_id = dispatch_resp.get("session_id")
                 if not bridge_task_id:
                     err_msg = f"Agent-Bridge dispatch did not return a task_id: {dispatch_resp}"
                     task.mark_failed(err_msg)
                     self.repo.update_task(task)
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
                 task.bridge_task_id = bridge_task_id
                 if session_id:
@@ -342,7 +360,7 @@ class Orchestrator:
                 except TaskTimeoutError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return self._progress_final(cancelled)
+                        return self._finish(cancelled, last_verification)
                     task.mark_timed_out(str(e))
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_TIMED_OUT", {"error": str(e)})
@@ -350,24 +368,24 @@ class Orchestrator:
                 except TaskCancelledError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return self._progress_final(cancelled)
+                        return self._finish(cancelled, last_verification)
                     task.mark_cancelled(str(e))
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"error": str(e)})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
                 except BridgeError as e:
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return self._progress_final(cancelled)
+                        return self._finish(cancelled, last_verification)
                     task.mark_failed(f"Сбой Agent-Bridge: {e}")
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": str(e)})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
                 # Check terminal state returned by waiter
                 cancelled = self._cancelled_task(task.id, bridge_task_id)
                 if cancelled:
-                    return self._progress_final(cancelled)
+                    return self._finish(cancelled, last_verification)
                 bridge_status = classify_bridge_status(wait_result.get("status"))
 
                 if bridge_status == "cancelled":
@@ -379,21 +397,21 @@ class Orchestrator:
                     task.mark_cancelled(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"error": err_text})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
                 if bridge_status == "failed":
                     err_text = wait_result.get("error") or "Antigravity reported failure."
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
                 if bridge_status != "completed":
                     err_text = f"Неожиданный статус завершения от Agent-Bridge: '{wait_result.get('status')}'"
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
 
             # Step 3: Collect Antigravity results & Git diff
             logger.info("Collecting Antigravity results from Agent-Bridge...")
@@ -402,7 +420,7 @@ class Orchestrator:
                 if not res_payload.get("ok", True):
                     cancelled = self._cancelled_task(task.id, bridge_task_id)
                     if cancelled:
-                        return self._progress_final(cancelled)
+                        return self._finish(cancelled, last_verification)
                     err_text = (
                         "Не удалось получить результат задачи из Agent-Bridge: "
                         f"{res_payload.get('error') or 'Bridge вернул ok=false.'}"
@@ -410,7 +428,7 @@ class Orchestrator:
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
-                    return self._progress_final(task)
+                    return self._finish(task, last_verification)
                 task.antigravity_result = (
                     res_payload.get("result_text") or str(res_payload)
                 )
@@ -421,7 +439,7 @@ class Orchestrator:
             task.git_diff = self.verifier.capture_git_diff(task.cwd)
             cancelled = self._cancelled_task(task.id, bridge_task_id)
             if cancelled:
-                return self._progress_final(cancelled)
+                return self._finish(cancelled, last_verification)
             self.repo.update_task(task)
             self.repo.record_event(
                 task.id,
@@ -452,7 +470,7 @@ class Orchestrator:
             )
             cancelled = self._cancelled_task(task.id, bridge_task_id)
             if cancelled:
-                return self._progress_final(cancelled)
+                return self._finish(cancelled, last_verification)
             last_verification = verification
             task.verification_verdict = verification.verdict
             task.verification_feedback = verification.feedback
@@ -521,20 +539,7 @@ class Orchestrator:
                 self.repo.update_task(task)
                 break
 
-        # Save final report to disk
-        events = self.repo.get_events(task.id)
-        report_text = self.retry_controller.generate_final_report(
-            task, last_verification, events
-        )
-        report_path = Path(task.cwd) / f"orchestrator_report_{task.id[:8]}.md"
-        try:
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write(report_text)
-            logger.info(f"Final report saved to: {report_path}")
-        except Exception as e:
-            logger.warning(f"Could not write report file to disk: {e}")
-
-        return self._progress_final(task)
+        return self._finish(task, last_verification)
 
     def recover(self) -> List[Task]:
         """Detects interrupted tasks after orchestrator crash/restart and restores lifecycle."""
@@ -551,7 +556,7 @@ class Orchestrator:
             logger.info(f"Recovering task {task.id} (Bridge ID: {task.bridge_task_id})...")
             cancelled = self._cancelled_task(task.id)
             if cancelled:
-                recovered.append(cancelled)
+                recovered.append(self._finish(cancelled))
                 continue
             if not task.bridge_task_id:
                 # Task was queued but not yet dispatched
@@ -569,7 +574,7 @@ class Orchestrator:
                 status_resp = self.bridge.check_task(task.bridge_task_id)
                 cancelled = self._cancelled_task(task.id)
                 if cancelled:
-                    recovered.append(cancelled)
+                    recovered.append(self._finish(cancelled))
                     continue
                 if not status_resp.get("ok", True):
                     # Bridge doesn't know about this task (process was terminated)
@@ -581,7 +586,7 @@ class Orchestrator:
                     )
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": task.error_message})
-                    recovered.append(task)
+                    recovered.append(self._finish(task))
                     continue
 
                 raw_status = status_resp.get("status")
@@ -604,7 +609,7 @@ class Orchestrator:
                             "TASK_ORPHANED",
                             {"bridge_task_id": task.bridge_task_id, "status": raw_status},
                         )
-                        recovered.append(task)
+                        recovered.append(self._finish(task))
                         continue
                     logger.info(
                         f"Task {task.id} is still running in Bridge ({bridge_status}). Resuming wait..."
@@ -621,34 +626,34 @@ class Orchestrator:
                     task.mark_cancelled(reason)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"reason": reason})
-                    recovered.append(task)
+                    recovered.append(self._finish(task))
                 elif bridge_status == "failed":
                     error_msg = status_resp.get("error") or "Задача завершилась с ошибкой в Bridge"
                     logger.warning(f"Task {task.id} failed in Bridge: {error_msg}")
                     task.mark_failed(error_msg)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": error_msg})
-                    recovered.append(task)
+                    recovered.append(self._finish(task))
                 else:
                     task.mark_failed(f"Статус задачи в Bridge: {raw_status}")
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"status": raw_status})
-                    recovered.append(task)
+                    recovered.append(self._finish(task))
 
             except Exception as e:
                 logger.error(f"Failed to recover task {task.id}: {e}")
                 cancelled = self._cancelled_task(task.id)
                 if cancelled:
-                    recovered.append(cancelled)
+                    recovered.append(self._finish(cancelled))
                     continue
                 task.mark_failed(f"Сбой восстановления: {e}")
                 self.repo.update_task(task)
                 self.repo.record_event(task.id, "TASK_FAILED", {"error": str(e)})
-                recovered.append(task)
+                recovered.append(self._finish(task))
 
         return recovered
 
-    def cancel_task(self, task_id: str) -> Task:
+    def cancel_task(self, task_id: str, *, notify_bridge: bool = True) -> Task:
         task = self.repo.get_task(task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found.")
@@ -656,7 +661,7 @@ class Orchestrator:
         if task.status.is_terminal:
             return task
 
-        if task.bridge_task_id:
+        if notify_bridge and task.bridge_task_id:
             try:
                 self.bridge.cancel_task(task.bridge_task_id)
             except Exception as e:
@@ -669,4 +674,4 @@ class Orchestrator:
         task.mark_cancelled("Отменено пользователем.")
         self.repo.update_task(task)
         self.repo.record_event(task.id, "USER_CANCELLED", {})
-        return task
+        return self._finish(task)

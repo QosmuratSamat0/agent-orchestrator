@@ -491,6 +491,18 @@ def test_fingerprint_tracks_untracked_content_and_ignores_caches(tmp_path):
     assert CodexVerifier._workspace_fingerprint(str(repo)) == after
 
 
+def test_fingerprint_without_commits_tracks_untracked_content(tmp_path):
+    repo = tmp_path / "repo_without_commits"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    new_file = repo / "new_file.py"
+    new_file.write_text("first", encoding="utf-8")
+    before = CodexVerifier._workspace_fingerprint(str(repo))
+    assert before is not None
+    new_file.write_text("other", encoding="utf-8")
+    assert CodexVerifier._workspace_fingerprint(str(repo)) != before
+
+
 def test_timeout_kills_own_process_tree(fake_codex, monkeypatch):
     if os.name == "nt":
         probe = subprocess.run(["tasklist", "/FI", "PID eq 0"], capture_output=True, text=True)

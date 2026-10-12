@@ -73,7 +73,7 @@ def test_orchestrator_retry_loop_success_on_attempt_2(
     assert len(mock_verifier.verification_calls) == 2
 
 
-def test_orchestrator_retry_limit_reached(
+def test_orchestrator_unlimited_retries_until_pass(
     repo, mock_bridge: MockBridgeClient, mock_verifier: MockCodexVerifier, waiter, tmp_path: Path
 ):
     orchestrator = Orchestrator(
@@ -384,7 +384,7 @@ def test_cli_handlers_always_close_fake_orchestrator(monkeypatch, tmp_path):
         def recover(self):
             return []
 
-        def cancel_task(self, *_):
+        def cancel_task(self, *_, **__):
             return task
 
         def close(self):
@@ -643,6 +643,8 @@ def test_orchestrator_deadline_across_attempts(
     # After attempt 3 verification, remaining is -300 <= 0, so loop terminates.
     # Total dispatches is 3; no dispatch occurred after the deadline (4000 > 3700).
     assert len(mock_bridge.dispatched_tasks) == 3
+    report = (tmp_path / f"orchestrator_report_{task.id[:8]}.md").read_text(encoding="utf-8")
+    assert "TIMED_OUT" in report and "Превышен общий лимит" in report
 
 
 def test_orchestrator_deadline_survives_restart(
@@ -887,6 +889,9 @@ def test_recover_bridge_exception_records_failure(repo, mock_verifier, tmp_path)
         e.event_type == "TASK_FAILED" and "Bridge недоступен" in e.payload["error"]
         for e in repo.get_events(task.id)
     )
+    assert "Сбой восстановления: Bridge недоступен" in (
+        tmp_path / f"orchestrator_report_{task.id[:8]}.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_recover_external_cancel_ignores_bridge_result(temp_db, tmp_path):
@@ -907,6 +912,9 @@ def test_recover_external_cancel_ignores_bridge_result(temp_db, tmp_path):
     assert orchestrator.recover()[0].status == TaskStatus.CANCELLED
     assert repo.get_task(active.id).status == TaskStatus.CANCELLED
     assert verifier.verification_calls == []
+    assert "Отменено пользователем" in (
+        tmp_path / f"orchestrator_report_{active.id[:8]}.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_completion_write_cannot_overwrite_external_cancel(temp_db, tmp_path):
@@ -995,6 +1003,147 @@ def test_recover_completed_from_state_without_result_fails(repo, mock_verifier, 
     assert any(e.event_type == "TASK_FAILED" for e in repo.get_events(task.id))
     assert mock_verifier.verification_calls == []
     assert bridge.dispatched_tasks == []
+
+
+@pytest.mark.parametrize(
+    "kind, expected_status, reason",
+    [
+        ("dispatch_exception", TaskStatus.FAILED, "Отправка недоступна"),
+        ("dispatch_no_id", TaskStatus.FAILED, "task_id"),
+        ("bridge_failed", TaskStatus.FAILED, "Сбой агента"),
+        ("bridge_cancelled", TaskStatus.CANCELLED, "Отменено Bridge"),
+        ("wait_timeout", TaskStatus.TIMED_OUT, "Время ожидания истекло"),
+        ("wait_orphan", TaskStatus.FAILED, "Прежний Bridge"),
+        ("result_error", TaskStatus.FAILED, "Результат недоступен"),
+        ("verifier_failed", TaskStatus.FAILED, "Проверка отклонена"),
+        ("passed", TaskStatus.COMPLETED, "PASSED"),
+    ],
+)
+def test_every_run_exit_writes_one_report(
+    repo, tmp_path, kind, expected_status, reason, monkeypatch
+):
+    bridge = MockBridgeClient()
+    verifier = MockCodexVerifier()
+    if kind == "dispatch_exception":
+        monkeypatch.setattr(bridge, "dispatch_task", lambda **_: (_ for _ in ()).throw(RuntimeError(reason)))
+    elif kind == "dispatch_no_id":
+        monkeypatch.setattr(bridge, "dispatch_task", lambda **_: {"ok": True})
+    elif kind in ("bridge_failed", "bridge_cancelled"):
+        original = bridge.dispatch_task
+        def dispatch(**kwargs):
+            result = original(**kwargs)
+            bridge.tasks_status_map[result["task_id"]] = {
+                "ok": True,
+                "status": "failed" if kind == "bridge_failed" else "cancelled",
+                "error": reason,
+            }
+            return result
+        monkeypatch.setattr(bridge, "dispatch_task", dispatch)
+    elif kind == "result_error":
+        monkeypatch.setattr(bridge, "get_result", lambda *_: {"ok": False, "error": reason})
+    elif kind in ("wait_timeout", "wait_orphan"):
+        error_type = TaskTimeoutError if kind == "wait_timeout" else BridgeError
+        class FailingWaiter:
+            def wait_for_completion(self, *_args, **_kwargs):
+                raise error_type(reason)
+        waiter = FailingWaiter()
+    if kind == "verifier_failed":
+        verifier.set_next_verdict(VerificationVerdict.FAILED, reason)
+
+    controller = SimpleNamespace(
+        generate_final_report=lambda task, verification, events: (
+            f"{task.status.value.upper()} {task.error_message or ''} "
+            f"{verification.verdict.value.upper() if verification else ''}"
+        ),
+        build_refinement_prompt=lambda *_: "Повторить",
+    )
+    report_calls = []
+    original_report = controller.generate_final_report
+    controller.generate_final_report = lambda *args: (report_calls.append(args), original_report(*args))[1]
+    runner = Orchestrator(repository=repo, bridge=bridge, verifier=verifier,
+                          waiter=waiter if kind in ("wait_timeout", "wait_orphan") else None,
+                          retry_controller=controller)
+    task = runner.create_task("Отчёт", "Проверить", cwd=str(tmp_path))
+    result = runner.run_task(task.id)
+    report = tmp_path / f"orchestrator_report_{task.id[:8]}.md"
+    assert result.status == expected_status
+    assert len(report_calls) == 1
+    assert len(list(tmp_path.glob("orchestrator_report_*.md"))) == 1
+    assert result.status.value.upper() in report.read_text(encoding="utf-8")
+    assert reason in report.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("bridge_response, expected_status, reason", [
+    ({"ok": False}, TaskStatus.FAILED, "не найдена"),
+    ({"ok": True, "status": "failed", "error": "Сбой Bridge"}, TaskStatus.FAILED, "Сбой Bridge"),
+    ({"ok": True, "status": "cancelled", "reason": "Отмена Bridge"}, TaskStatus.CANCELLED, "Отмена Bridge"),
+    ({"ok": True, "status": "unknown"}, TaskStatus.FAILED, "unknown"),
+    ({"ok": True, "status": "running", "from_state": True}, TaskStatus.FAILED, "вручную"),
+])
+def test_recover_terminal_branch_writes_report(
+    repo, mock_bridge, mock_verifier, tmp_path, bridge_response, expected_status, reason
+):
+    runner = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = _stage3_interrupted(runner, tmp_path)
+    mock_bridge.tasks_status_map[task.bridge_task_id] = bridge_response
+    result = runner.recover()[0]
+    report = (tmp_path / f"orchestrator_report_{task.id[:8]}.md").read_text(encoding="utf-8")
+    assert result.status == expected_status
+    assert result.status.value.upper() in report
+    assert reason in report
+
+
+def test_cancel_without_bridge_writes_report_and_default_notifies(repo, mock_bridge, tmp_path):
+    runner = Orchestrator(repository=repo, bridge=mock_bridge)
+    first = _stage3_interrupted(runner, tmp_path, "first")
+    result = runner.cancel_task(first.id, notify_bridge=False)
+    assert result.status == TaskStatus.CANCELLED
+    assert mock_bridge.cancelled_tasks == []
+    assert "Отменено пользователем." in (
+        tmp_path / f"orchestrator_report_{first.id[:8]}.md"
+    ).read_text(encoding="utf-8")
+    second = runner.create_task("Отмена", "Задача", cwd=str(tmp_path))
+    second.mark_running(bridge_task_id="second")
+    repo.update_task(second)
+    runner.cancel_task(second.id)
+    assert mock_bridge.cancelled_tasks == ["second"]
+
+
+def test_router_is_lazy_for_repository_actions(repo, mock_bridge, tmp_path, monkeypatch):
+    from agent_orchestrator import orchestrator as module
+
+    original_router = module.ModelRouter
+    calls = []
+    def make_router(*args, **kwargs):
+        calls.append(1)
+        return original_router(*args, **kwargs)
+
+    monkeypatch.setattr(module, "ModelRouter", make_router)
+    runner = Orchestrator(repository=repo, bridge=mock_bridge)
+    interrupted = repo.create_task(Task(title="Восстановление", prompt="Проверка", cwd=str(tmp_path)))
+    interrupted.mark_running(bridge_task_id="previous_bridge")
+    repo.update_task(interrupted)
+    mock_bridge.tasks_status_map["previous_bridge"] = {
+        "ok": True, "status": "running", "from_state": True,
+    }
+    assert runner.repo.get_task(interrupted.id)
+    assert runner.repo.list_tasks()
+    assert runner.recover()[0].status == TaskStatus.FAILED
+    task = repo.create_task(Task(title="Отмена", prompt="Проверка", cwd=str(tmp_path)))
+    assert runner.cancel_task(task.id, notify_bridge=False).status == TaskStatus.CANCELLED
+    assert calls == []
+    runner.create_task("Новая", "Проверить", cwd=str(tmp_path))
+    assert len(calls) == 1
+
+
+def test_report_write_failure_does_not_change_terminal_status(repo, mock_bridge, mock_verifier, tmp_path, caplog):
+    runner = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    missing_dir = tmp_path / "missing"
+    task = runner.create_task("Отчёт", "Проверить", cwd=str(missing_dir))
+    result = runner.run_task(task.id)
+    assert result.status == TaskStatus.COMPLETED
+    assert repo.get_task(task.id).status == TaskStatus.COMPLETED
+    assert "Не удалось записать итоговый отчёт" in caplog.text
 
 
 
