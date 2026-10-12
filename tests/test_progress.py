@@ -323,3 +323,48 @@ def test_none_silent_for_sec_is_not_printed(tmp_path):
     text = (tmp_path / f"{task.id[:8]}.log").read_text(encoding="utf-8")
     assert "статус running" in text
     assert "None" not in text and "тишина" not in text
+
+
+def _real_step(step_type, state, **extra):
+    # Shapes copied from a real Agent-Bridge transcript of an Antigravity run.
+    step = {"conversation_id": "c", "step_index": 1, "state": state, "step_type": step_type, **extra}
+    return {"type": "tool_call" if step_type == "tool" else "message_chunk", "ts": "t",
+            "data": {"payload": {"event": "step_update", "step_update": step}}}
+
+
+def test_describe_real_transcript_events():
+    from agent_orchestrator.progress import describe_transcript_event as describe
+
+    assert describe({"type": "prompt_sent", "data": {"text": "Fix calc", "cmd": ["agy"]}}) == "prompt_sent: Fix calc"
+    assert describe({"type": "raw", "data": {"payload": {"event": "init", "init": {"model": "gemini-3.8-flash-high"}}}}) \
+        == "старт агента: модель gemini-3.8-flash-high"
+    assert describe({"type": "raw", "data": {"payload": {"event": "other"}}}) is None
+    view = _real_step("tool", "DONE", tool_name="view_file",
+                      tool_info={"name": "view_file", "parameters": {"AbsolutePath": r"C:\s\calc.py"}, "output": "3 lines, 32 bytes"})
+    assert describe(view) == r"инструмент view_file C:\s\calc.py [DONE] → 3 lines, 32 bytes"
+    run = _real_step("tool", "DONE", tool_name="run_command",
+                     tool_info={"parameters": {"CommandLine": "pytest test_calc.py"},
+                                "output": "==== test session starts ====\nplatform win32\n\n==== 1 passed in 0.02s ===="})
+    assert describe(run) == "инструмент run_command pytest test_calc.py [DONE] → 1 passed in 0.02s"
+    assert describe(_real_step("tool", "ACTIVE", tool_name="view_file")) == "инструмент view_file [ACTIVE]"
+    assert describe(_real_step("agent_response", "DONE")) == "ответ агента [DONE]"
+    assert describe({"type": "turn_end", "data": {"stop_reason": "end_turn"}}) == "конец хода: end_turn"
+    assert describe("garbage") is None and describe({"type": "x", "data": "y"}) == "x"
+
+
+def test_feed_collapses_identical_consecutive_transcript_lines(tmp_path):
+    from agent_orchestrator.models import Task
+    from agent_orchestrator.progress import ProgressFeed
+
+    events = [_real_step("agent_response", "DONE")] * 5 + [_real_step("tool", "DONE", tool_name="view_file")]
+
+    class Bridge:
+        def get_transcript(self, session_id, offset=0, limit=50, kinds=None):
+            page = events[offset:offset + limit]
+            return {"ok": True, "events": page, "next_offset": offset + len(page)}
+
+    task = Task(title="t", prompt="p", bridge_session_id="sess_1")
+    ProgressFeed(log_dir=tmp_path, poll_interval_sec=0).on_wait_progress(task, Bridge(), {"status": "running"})
+    lines = (tmp_path / f"{task.id[:8]}.log").read_text(encoding="utf-8").splitlines()
+    assert sum("ответ агента [DONE]" in line for line in lines) == 1
+    assert any("инструмент view_file [DONE]" in line for line in lines)
