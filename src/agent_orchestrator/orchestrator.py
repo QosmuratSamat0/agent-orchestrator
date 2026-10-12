@@ -38,6 +38,22 @@ def _parse_iso_to_epoch(iso_str: str) -> float:
     return dt.timestamp()
 
 
+BRIDGE_ERROR_TEXT = {
+    # Set by a new Agent-Bridge process for tasks left by a process that died (seen in a real hard-crash run).
+    "bridge_restarted": (
+        "Agent-Bridge был перезапущен после аварийного завершения: выполнение задачи прервано. "
+        "Проверьте изменения в рабочем каталоге и запустите задачу заново."
+    ),
+}
+
+
+def _bridge_error_text(error: Optional[str], default: str) -> str:
+    """Readable Russian text for known Agent-Bridge error codes; unknown errors are kept as they are."""
+    if not error:
+        return default
+    return BRIDGE_ERROR_TEXT.get(str(error).strip(), str(error))
+
+
 def _attempt_request_id(request_id: str, retry_count: int) -> str:
     try:
         namespace = uuid.UUID(request_id)
@@ -420,7 +436,7 @@ class Orchestrator:
                     return self._finish(task, last_verification)
 
                 if bridge_status == "failed":
-                    err_text = wait_result.get("error") or "Antigravity reported failure."
+                    err_text = _bridge_error_text(wait_result.get("error"), "Antigravity reported failure.")
                     task.mark_failed(err_text)
                     self.repo.update_task(task)
                     self.repo.record_event(task.id, "TASK_FAILED", {"error": err_text})
@@ -648,7 +664,9 @@ class Orchestrator:
                     self.repo.record_event(task.id, "TASK_CANCELLED", {"reason": reason})
                     recovered.append(self._finish(task))
                 elif bridge_status == "failed":
-                    error_msg = status_resp.get("error") or "Задача завершилась с ошибкой в Bridge"
+                    error_msg = _bridge_error_text(
+                        status_resp.get("error"), "Задача завершилась с ошибкой в Bridge"
+                    )
                     logger.warning(f"Task {task.id} failed in Bridge: {error_msg}")
                     task.mark_failed(error_msg)
                     self.repo.update_task(task)

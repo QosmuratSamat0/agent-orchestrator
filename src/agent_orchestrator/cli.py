@@ -177,8 +177,11 @@ def cmd_cancel(args: argparse.Namespace) -> None:
     config = OrchestratorConfig.load(args.config)
     orchestrator = Orchestrator(config=config)
     try:
-
+        before = orchestrator.repo.get_task(args.task_id)
         task = orchestrator.cancel_task(args.task_id, notify_bridge=False)
+        if before is not None and before.status.is_terminal:
+            print(f"Задача {task.id[:8]} уже завершена со статусом {task.status.value}; отмена не требуется.")
+            return
         print(f"Задача {task.id[:8]} переведена в статус: {task.status.value}")
         print(
             "Отмена записана в базе данных. Если оркестратор запущен, работа агента "

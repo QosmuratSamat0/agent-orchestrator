@@ -141,3 +141,22 @@ def test_real_sqlite_file_persistence_and_reload(tmp_path: Path):
     assert reloaded.title == "Persisted Task"
     assert reloaded.status == TaskStatus.RUNNING
     assert reloaded.bridge_task_id == "bridge_id_101"
+
+
+def test_cli_cancel_of_finished_task_says_nothing_to_cancel(tmp_path, monkeypatch, capsys):
+    # Seen in a real run: cancelling an already completed task printed "Отмена записана...".
+    from agent_orchestrator import cli
+
+    cfg = OrchestratorConfig(db_path=str(tmp_path / "tasks.sqlite"))
+    repo = TaskRepository(cfg.db_path)
+    task = repo.create_task(Task(title="Готово", prompt="p", cwd=str(tmp_path)))
+    task.mark_completed()
+    repo.update_task(task)
+    monkeypatch.setattr(cli.OrchestratorConfig, "load", lambda *_, **__: cfg)
+
+    cli.cmd_cancel(argparse.Namespace(config=None, task_id=task.id))
+
+    output = capsys.readouterr().out
+    assert "уже завершена" in output and "completed" in output
+    assert "Отмена записана" not in output
+    assert repo.get_task(task.id).status == TaskStatus.COMPLETED

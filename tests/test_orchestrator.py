@@ -1249,3 +1249,33 @@ def test_mock_bridge_rejects_leveled_slug_with_effort(mock_bridge: MockBridgeCli
     assert resp["ok"] is False
     assert "conflicts with --effort" in resp["error"]
     assert mock_bridge.dispatched_tasks == []
+
+
+def test_bridge_restarted_error_is_explained_in_recover_and_run(
+    repo, mock_bridge: MockBridgeClient, mock_verifier: MockCodexVerifier, waiter, tmp_path: Path
+):
+    # Real hard-crash run: the new Bridge reports the dead process's task as failed / "bridge_restarted".
+    orchestrator = Orchestrator(
+        config=OrchestratorConfig(max_active_tasks=5), repository=repo, bridge=mock_bridge,
+        verifier=mock_verifier, waiter=waiter,
+    )
+    crashed = orchestrator.create_task(title="Crashed", prompt="p", cwd=str(tmp_path))
+    crashed.mark_running(bridge_task_id="br_dead")
+    repo.update_task(crashed)
+    mock_bridge.tasks_status_map["br_dead"] = {"ok": True, "status": "failed", "error": "bridge_restarted"}
+
+    orchestrator.recover()
+    recovered = repo.get_task(crashed.id)
+    assert recovered.status == TaskStatus.FAILED
+    assert "перезапущен" in recovered.error_message and "bridge_restarted" not in recovered.error_message
+    assert mock_bridge.dispatched_tasks == []
+
+    live = orchestrator.create_task(title="Live", prompt="p", cwd=str(tmp_path))
+    mock_bridge.tasks_status_map["mock_task_1"] = {"ok": True, "status": "failed", "error": "bridge_restarted"}
+    finished = orchestrator.run_task(live.id)
+    assert finished.status == TaskStatus.FAILED
+    assert "перезапущен" in finished.error_message
+
+    other = orchestrator.create_task(title="Other", prompt="p", cwd=str(tmp_path))
+    mock_bridge.tasks_status_map["mock_task_2"] = {"ok": True, "status": "failed", "error": "Syntax exception"}
+    assert orchestrator.run_task(other.id).error_message == "Syntax exception"
