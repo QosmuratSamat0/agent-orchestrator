@@ -56,6 +56,8 @@ class TaskRepository:
                     model_reason TEXT,
                     bridge_task_id TEXT,
                     bridge_session_id TEXT,
+                    owner_pid INTEGER,
+                    heartbeat_at TEXT,
                     request_id TEXT NOT NULL UNIQUE,
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     max_retries INTEGER NOT NULL DEFAULT 3,
@@ -86,6 +88,11 @@ class TaskRepository:
                 CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            if "owner_pid" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN owner_pid INTEGER")
+            if "heartbeat_at" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT")
             conn.commit()
 
     def create_task(self, task: Task, max_active: int = 1) -> Task:
@@ -107,11 +114,12 @@ class TaskRepository:
                 INSERT INTO tasks (
                     id, title, prompt, acceptance_criteria, cwd, status, complexity,
                     model, effort, model_reason, bridge_task_id, bridge_session_id,
+                    owner_pid, heartbeat_at,
                     request_id, retry_count, max_retries, current_attempt,
                     antigravity_result, git_diff, verification_verdict,
                     verification_feedback, error_message, created_at, started_at,
                     finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -126,6 +134,8 @@ class TaskRepository:
                     task.model_reason,
                     task.bridge_task_id,
                     task.bridge_session_id,
+                    task.owner_pid,
+                    task.heartbeat_at,
                     task.request_id,
                     task.retry_count,
                     task.max_retries,
@@ -208,14 +218,26 @@ class TaskRepository:
             if cursor.rowcount == 0:
                 raise RepositoryError(f"Task with ID {task.id} not found.")
             stored = conn.execute(
-                "SELECT status, error_message, finished_at FROM tasks WHERE id = ?",
+                "SELECT status, error_message, finished_at, owner_pid, heartbeat_at FROM tasks WHERE id = ?",
                 (task.id,),
             ).fetchone()
             task.status = TaskStatus(stored["status"])
             task.error_message = stored["error_message"]
             task.finished_at = stored["finished_at"]
+            task.owner_pid = stored["owner_pid"]
+            task.heartbeat_at = stored["heartbeat_at"]
             conn.commit()
         return task
+
+    def touch_owner(self, task_id: str, pid: int) -> None:
+        """Keep worker ownership fresh without overwriting other task fields."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET owner_pid = ?, heartbeat_at = ? "
+                "WHERE id = ? AND status IN (?, ?)",
+                (pid, now, task_id, TaskStatus.QUEUED.value, TaskStatus.RUNNING.value),
+            )
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._get_connection() as conn:

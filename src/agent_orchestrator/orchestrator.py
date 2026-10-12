@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
+from threading import Event, Thread
 import time
 from typing import Callable, List, Optional
 import uuid
@@ -217,6 +218,40 @@ class Orchestrator:
         on_step_callback: Optional[Callable[[str, Task], None]] = None,
         resume: Optional[str] = None,
         resume_running: bool = False,
+        allow_dispatch: bool = True,
+    ) -> Task:
+        task = self.repo.get_task(task_id)
+        if not task or task.status.is_terminal:
+            return self._run_task(task_id, on_step_callback, resume, resume_running, allow_dispatch)
+
+        self.repo.touch_owner(task_id, os.getpid())
+        stop = Event()
+        interval = float(self.config.progress.poll_interval_sec)
+        if interval <= 0:
+            interval = 0.1
+
+        def keep_alive() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.repo.touch_owner(task_id, os.getpid())
+                except Exception:
+                    logger.exception("Не удалось обновить heartbeat задачи %s", task_id)
+
+        heartbeat = Thread(target=keep_alive, name="orchestrator-heartbeat", daemon=True)
+        heartbeat.start()
+        try:
+            return self._run_task(task_id, on_step_callback, resume, resume_running, allow_dispatch)
+        finally:
+            stop.set()
+            heartbeat.join(timeout=1)
+
+    def _run_task(
+        self,
+        task_id: str,
+        on_step_callback: Optional[Callable[[str, Task], None]] = None,
+        resume: Optional[str] = None,
+        resume_running: bool = False,
+        allow_dispatch: bool = True,
     ) -> Task:
         task = self.repo.get_task(task_id)
         if not task:
@@ -304,6 +339,11 @@ class Orchestrator:
                     f"задачи {task.id} (Bridge ID: {bridge_task_id})..."
                 )
             else:
+                if not allow_dispatch:
+                    task.mark_failed("Восстановление не может повторно отправить задачу в Antigravity. Проверьте работу агента вручную.")
+                    self.repo.update_task(task)
+                    self.repo.record_event(task.id, "TASK_FAILED", {"error": task.error_message})
+                    return self._finish(task, last_verification)
                 logger.info(f"[{attempt_label}] Dispatching to Antigravity via Agent-Bridge...")
                 if on_step_callback:
                     on_step_callback(f"dispatching_antigravity_{task.retry_count + 1}", task)
@@ -577,9 +617,11 @@ class Orchestrator:
 
         return self._finish(task, last_verification)
 
-    def recover(self) -> List[Task]:
+    def recover(self, task_id: Optional[str] = None, *, allow_dispatch: bool = True) -> List[Task]:
         """Detects interrupted tasks after orchestrator crash/restart and restores lifecycle."""
         interrupted = self.repo.get_interrupted_tasks()
+        if task_id is not None:
+            interrupted = [task for task in interrupted if task.id == task_id]
         recovered: List[Task] = []
 
         if not interrupted:
@@ -597,12 +639,12 @@ class Orchestrator:
             if not task.bridge_task_id:
                 # Task was queued but not yet dispatched
                 logger.info(f"Task {task.id} was queued. Starting execution now.")
-                res_task = self.run_task(task.id)
+                res_task = self.run_task(task.id, allow_dispatch=allow_dispatch)
                 recovered.append(res_task)
                 continue
 
             if self._retry_pending(task):
-                recovered.append(self.run_task(task.id))
+                recovered.append(self.run_task(task.id, allow_dispatch=allow_dispatch))
                 continue
 
             try:
@@ -631,7 +673,7 @@ class Orchestrator:
                     logger.info(
                         f"Task {task.id} completed while orchestrator was offline. Continuing with verification."
                     )
-                    recovered.append(self.run_task(task.id, resume="verify"))
+                    recovered.append(self.run_task(task.id, resume="verify", allow_dispatch=allow_dispatch))
                 elif bridge_status in ("running", "queued"):
                     if status_resp.get("from_state"):
                         task.mark_failed(
@@ -650,7 +692,7 @@ class Orchestrator:
                     logger.info(
                         f"Task {task.id} is still running in Bridge ({bridge_status}). Resuming wait..."
                     )
-                    res_task = self.run_task(task.id, resume="wait")
+                    res_task = self.run_task(task.id, resume="wait", allow_dispatch=allow_dispatch)
                     recovered.append(res_task)
                 elif bridge_status == "cancelled":
                     reason = (

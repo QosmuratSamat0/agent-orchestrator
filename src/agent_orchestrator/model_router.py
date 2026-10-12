@@ -65,6 +65,7 @@ class ModelRouter:
         try:
             res = subprocess.run(
                 [self.agy_bin, "models"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=15,

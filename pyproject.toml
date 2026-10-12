@@ -16,6 +16,7 @@ dependencies = []
 
 [project.scripts]
 agent-orchestrator = "agent_orchestrator.cli:main"
+agent-orchestrator-mcp = "agent_orchestrator.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

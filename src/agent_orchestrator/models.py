@@ -132,6 +132,8 @@ class Task:
     # Agent-Bridge tracking
     bridge_task_id: Optional[str] = None
     bridge_session_id: Optional[str] = None
+    owner_pid: Optional[int] = None
+    heartbeat_at: Optional[str] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     # Lifecycle & Retry control
@@ -206,6 +208,8 @@ class Task:
             "model_reason": self.model_reason,
             "bridge_task_id": self.bridge_task_id,
             "bridge_session_id": self.bridge_session_id,
+            "owner_pid": self.owner_pid,
+            "heartbeat_at": self.heartbeat_at,
             "request_id": self.request_id,
             "retry_count": self.retry_count,
             "max_retries": self.max_retries,
@@ -239,6 +243,8 @@ class Task:
             model_reason=data.get("model_reason", ""),
             bridge_task_id=data.get("bridge_task_id"),
             bridge_session_id=data.get("bridge_session_id"),
+            owner_pid=data.get("owner_pid"),
+            heartbeat_at=data.get("heartbeat_at"),
             request_id=data.get("request_id", str(uuid.uuid4())),
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
