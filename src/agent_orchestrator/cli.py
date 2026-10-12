@@ -90,6 +90,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         report_path = Path(completed_task.cwd) / f"orchestrator_report_{completed_task.id[:8]}.md"
         if report_path.exists():
             print(f"\n📄 Итоговый отчёт сохранён: {report_path}")
+        raise SystemExit(0 if completed_task.status == TaskStatus.COMPLETED else 1)
     finally:
         orchestrator.close()
 

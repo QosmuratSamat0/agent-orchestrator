@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -13,6 +14,50 @@ from agent_orchestrator.orchestrator import Orchestrator
 from agent_orchestrator.repository import TaskRepository
 from agent_orchestrator.models import Task
 from tests.conftest import MockBridgeClient, MockCodexVerifier
+
+
+@pytest.mark.parametrize("status, exit_code", [
+    (TaskStatus.FAILED, 1),
+    (TaskStatus.COMPLETED, 0),
+])
+def test_cmd_run_exit_code_and_close_with_fake_orchestrator(
+    tmp_path, monkeypatch, capsys, status, exit_code
+):
+    from agent_orchestrator import cli
+
+    task = Task(title="Проверка", prompt="Задача", cwd=str(tmp_path))
+    if status == TaskStatus.FAILED:
+        task.mark_failed("Ошибка Bridge")
+    else:
+        task.mark_completed()
+    report_path = tmp_path / f"orchestrator_report_{task.id[:8]}.md"
+    report_path.write_text("Отчёт", encoding="utf-8")
+    closed = []
+
+    class FakeOrchestrator:
+        def __init__(self, config):
+            self.progress = None
+
+        def create_task(self, **_):
+            return task
+
+        def run_task(self, *_args, **_kwargs):
+            return task
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(cli.OrchestratorConfig, "load", lambda *_: OrchestratorConfig())
+    args = argparse.Namespace(config=None, title=task.title, prompt=task.prompt,
+                              criteria="", cwd=str(tmp_path), model=None, effort=None)
+    with pytest.raises(SystemExit) as result:
+        cli.cmd_run(args)
+    assert result.value.code == exit_code
+    assert closed == [True]
+    output = capsys.readouterr().out
+    assert status.value.upper() in output
+    assert str(report_path) in output
 
 
 def test_cli_models_command(capsys):

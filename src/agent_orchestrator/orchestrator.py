@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import time
 from typing import Callable, List, Optional
+import uuid
 
 from agent_orchestrator.bridge_client import BridgeClient, BridgeError
 from agent_orchestrator.codex_verifier import CodexVerifier
@@ -35,6 +36,14 @@ def _parse_iso_to_epoch(iso_str: str) -> float:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def _attempt_request_id(request_id: str, retry_count: int) -> str:
+    try:
+        namespace = uuid.UUID(request_id)
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{request_id}:{retry_count}"))
+    return str(uuid.uuid5(namespace, str(retry_count)))
 
 
 class Orchestrator:
@@ -298,7 +307,7 @@ class Orchestrator:
                         model=task.model,
                         effort=task.effort,
                         title=f"{task.title} (Attempt {task.retry_count + 1})",
-                        request_id=f"{task.request_id}_{task.retry_count}",
+                        request_id=_attempt_request_id(task.request_id, task.retry_count),
                         session_id=task.bridge_session_id,
                     )
                 except Exception as e:
@@ -316,12 +325,23 @@ class Orchestrator:
                 cancelled = self._cancelled_task(task.id, bridge_task_id)
                 if cancelled:
                     return self._finish(cancelled, last_verification)
-                session_id = dispatch_resp.get("session_id")
-                if not bridge_task_id:
-                    err_msg = f"Agent-Bridge dispatch did not return a task_id: {dispatch_resp}"
+                if dispatch_resp.get("ok") is False or not bridge_task_id:
+                    error = str(dispatch_resp.get("error") or "Agent-Bridge не вернул task_id.")
+                    error_type = dispatch_resp.get("error_type")
+                    detail = (
+                        f"{error_type}: {error}"
+                        if error_type and not error.startswith(f"{error_type}:")
+                        else error
+                    )
+                    err_msg = f"Не удалось отправить задачу в Agent-Bridge: {detail}"
                     task.mark_failed(err_msg)
                     self.repo.update_task(task)
+                    self.repo.record_event(
+                        task.id, "DISPATCH_FAILED", {"error": error, "error_type": error_type}
+                    )
                     return self._finish(task, last_verification)
+
+                session_id = dispatch_resp.get("session_id")
 
                 task.bridge_task_id = bridge_task_id
                 if session_id:

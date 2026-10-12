@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 import time
 from types import SimpleNamespace
+import uuid
 
 import pytest
 
 from agent_orchestrator.bridge_client import BridgeError
 from agent_orchestrator.config import OrchestratorConfig
 from agent_orchestrator.models import Task, TaskStatus, VerificationVerdict
-from agent_orchestrator.orchestrator import Orchestrator
+from agent_orchestrator.orchestrator import Orchestrator, _attempt_request_id
 from agent_orchestrator.repository import TaskRepository
 from agent_orchestrator.waiter import (
     NonLLMWaiter,
@@ -19,6 +20,60 @@ from agent_orchestrator.waiter import (
     TaskTimeoutError,
 )
 from tests.conftest import MockBridgeClient, MockCodexVerifier
+
+
+@pytest.mark.parametrize("task_request_id", [str(uuid.uuid4()), "legacy-request-id"])
+def test_attempt_request_id_is_a_deterministic_uuid(task_request_id):
+    request_ids = [_attempt_request_id(task_request_id, attempt) for attempt in range(3)]
+    assert request_ids == [_attempt_request_id(task_request_id, attempt) for attempt in range(3)]
+    assert len(set(request_ids)) == 3
+    assert all(str(uuid.UUID(request_id)) == request_id for request_id in request_ids)
+    expected = (
+        uuid.uuid5(uuid.UUID(task_request_id), "1")
+        if task_request_id != "legacy-request-id"
+        else uuid.uuid5(uuid.NAMESPACE_URL, "legacy-request-id:1")
+    )
+    assert request_ids[1] == str(expected)
+
+
+def test_mock_bridge_rejects_non_uuid_request_id():
+    bridge = MockBridgeClient()
+    response = bridge.dispatch_task(agent="antigravity", message="Проверить", cwd=".",
+                                    request_id="not-a-uuid")
+    assert response == {
+        "ok": False,
+        "error": "ValueError: request_id must be a UUID",
+        "error_type": "ValueError",
+    }
+    assert bridge.dispatched_tasks == []
+    assert bridge.tasks_status_map == {}
+
+
+def test_dispatch_rejection_records_bridge_error_and_one_report(
+    repo, mock_bridge, mock_verifier, tmp_path, monkeypatch
+):
+    rejection = {
+        "ok": False,
+        "error": "ValueError: request_id must be a UUID",
+        "error_type": "ValueError",
+    }
+    monkeypatch.setattr(mock_bridge, "dispatch_task", lambda **_: rejection)
+    runner = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier)
+    task = runner.create_task("Отказ Bridge", "Проверить", cwd=str(tmp_path))
+
+    result = runner.run_task(task.id)
+
+    assert result.status == TaskStatus.FAILED
+    assert rejection["error"] in result.error_message
+    assert repo.get_task(task.id).error_message == result.error_message
+    assert [(event.event_type, event.payload) for event in repo.get_events(task.id)
+            if event.event_type == "DISPATCH_FAILED"] == [
+        ("DISPATCH_FAILED", {"error": rejection["error"], "error_type": rejection["error_type"]})
+    ]
+    reports = list(tmp_path.glob("orchestrator_report_*.md"))
+    assert len(reports) == 1
+    assert rejection["error"] in reports[0].read_text(encoding="utf-8")
+    assert mock_verifier.verification_calls == []
 
 
 def test_orchestrator_first_attempt_success(
@@ -393,7 +448,10 @@ def test_cli_handlers_always_close_fake_orchestrator(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
     args = argparse.Namespace(config=None, title="Тест", prompt="Проверка", criteria="",
                               cwd=str(tmp_path), model=None, effort=None, task_id=task.id, status=None)
-    for handler in (cli.cmd_run, cli.cmd_submit, cli.cmd_status, cli.cmd_list,
+    with pytest.raises(SystemExit) as completed_exit:
+        cli.cmd_run(args)
+    assert completed_exit.value.code == 0
+    for handler in (cli.cmd_submit, cli.cmd_status, cli.cmd_list,
                     cli.cmd_recover, cli.cmd_cancel, cli.cmd_models, cli.cmd_report):
         handler(args)
     assert len(closed) == 8
@@ -431,6 +489,10 @@ def test_orchestrator_retry_semantic_counts(
     assert finished.retry_count == 2
     assert finished.current_attempt == 3
     assert len(mock_bridge.dispatched_tasks) == 3
+    request_ids = [entry["request_id"] for entry in mock_bridge.dispatched_tasks]
+    assert len(set(request_ids)) == 3
+    assert all(str(uuid.UUID(request_id)) == request_id for request_id in request_ids)
+    assert request_ids == [_attempt_request_id(task.request_id, attempt) for attempt in range(3)]
     assert len(mock_verifier.verification_calls) == 3
 
 
@@ -777,7 +839,7 @@ def test_recover_completed_retries_then_passes(repo, mock_bridge, mock_verifier,
     assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
     assert len(mock_bridge.dispatched_tasks) == 1
     retry = mock_bridge.dispatched_tasks[0]
-    assert retry["request_id"] == f"{task.request_id}_1"
+    assert retry["request_id"] == _attempt_request_id(task.request_id, 1)
     assert "Исправить проверку типов" in retry["message"]
     assert len(mock_verifier.verification_calls) == 2
 
@@ -864,7 +926,7 @@ def test_recover_dispatches_pending_retry_without_old_verification(repo, tmp_pat
     assert orchestrator.recover()[0].status == TaskStatus.COMPLETED
     assert bridge.check_calls == 0
     assert len(bridge.dispatched_tasks) == 1
-    assert bridge.dispatched_tasks[0]["request_id"] == f"{task.request_id}_1"
+    assert bridge.dispatched_tasks[0]["request_id"] == _attempt_request_id(task.request_id, 1)
     assert "Исправить восстановление" in bridge.dispatched_tasks[0]["message"]
     assert len(verifier.verification_calls) == 1
 

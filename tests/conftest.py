@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import faulthandler
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pytest
@@ -63,6 +64,15 @@ class MockBridgeClient(BridgeClient):
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if request_id is not None:
+            try:
+                uuid.UUID(request_id)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "ValueError: request_id must be a UUID",
+                    "error_type": "ValueError",
+                }
         self._counter += 1
         task_id = f"mock_task_{self._counter}"
         sess_id = session_id or f"mock_sess_{self._counter}"
