@@ -531,3 +531,100 @@ def test_timeout_without_child_returns_124(fake_codex, monkeypatch):
     result = verifier.verify("edit docs", "", "", str(root), timeout_sec=1)
     assert result.verdict == VerificationVerdict.FAILED and result.exit_code == 124
 
+
+
+# --- Regression: qoldau task 5c40c91b (Go + JS repository, non-ASCII sources) ---
+
+GO_OUTPUT = (
+    "?   \tqoldau/cmd/api\t[no test files]\n"
+    "ok  \tqoldau/internal/core/usecase\t0.412s\n"
+    "ok  \tqoldau/internal/infrastructure/email\t(cached)\n"
+)
+
+
+def _parse(final, events, criteria="tests for reset flow"):
+    return CodexVerifier().parse_verification_output(final, 0, criteria=criteria, prompt="", events_jsonl=events)
+
+
+def test_go_test_per_package_output_is_recognized_as_passed():
+    events = event(command='"powershell.exe" -Command \'go test ./...\'', output=GO_OUTPUT)
+    result = _parse("TESTS_STATUS: PASSED\nVERDICT: PASSED\nFEEDBACK:\n- ok", events)
+    assert result.tests_executed and result.tests_passed
+    assert result.verdict == VerificationVerdict.PASSED
+    assert "нет итоговой строки" not in result.test_evidence
+
+
+def test_go_test_failure_is_detected_even_with_exit_zero_wrapper():
+    events = event(command="go test ./...", output="--- FAIL: TestReset (0.00s)\nFAIL\tqoldau/internal/core/usecase\t0.3s\n")
+    result = _parse("VERDICT: PASSED", events)
+    assert result.tests_executed and not result.tests_passed
+    assert result.verdict == VerificationVerdict.RETRY_NEEDED
+
+
+def test_go_without_any_package_line_is_not_confirmed():
+    events = event(command="go test ./...", output="?   \tqoldau/cmd/api\t[no test files]\n")
+    result = _parse("VERDICT: PASSED", events)
+    assert not result.tests_passed
+    assert result.verdict == VerificationVerdict.FAILED
+
+
+def test_unconfirmed_tests_keep_retry_needed_instead_of_terminal_failed():
+    """A fixable RETRY_NEEDED must not become a terminal FAILED only because test evidence is missing."""
+    events = event(command="npm test", exit_code=0, output="navigation ok")
+    result = _parse("TESTS_STATUS: NOT_RUN\nVERDICT: RETRY_NEEDED\nFEEDBACK:\n- fix auth.go", events)
+    assert result.verdict == VerificationVerdict.RETRY_NEEDED
+    assert any("не подтверждён" in issue for issue in result.issues_found)
+
+
+def test_last_run_of_each_stack_counts():
+    # npm test failed (EPERM) and was re-run as `node --test`: the later JS run replaces it; Go stays green.
+    events = "\n".join([
+        event(command="go test ./...", output=GO_OUTPUT),
+        event(command="npm test", exit_code=1, output="EPERM: operation not permitted"),
+        event(command="node --test tests/", exit_code=0, output="# tests 10\n# pass 10\n# fail 0\n"),
+    ])
+    result = _parse("VERDICT: PASSED", events)
+    assert result.tests_passed and result.verdict == VerificationVerdict.PASSED
+    # A red stack is not hidden by a green one.
+    events = "\n".join([
+        event(command="npm test", output="Tests:  10 passed, 10 total"),
+        event(command="go test ./...", exit_code=1, output="FAIL\tqoldau/x\t0.1s\n"),
+    ])
+    result = _parse("VERDICT: PASSED", events)
+    assert result.tests_executed and not result.tests_passed
+    assert result.verdict == VerificationVerdict.RETRY_NEEDED
+
+
+@pytest.mark.parametrize("output", ["Tests  10 passed (10)", "Tests:  10 passed, 10 total"])
+def test_vitest_and_jest_summaries(output):
+    result = _parse("VERDICT: PASSED", event(command="npx vitest run", output=output))
+    assert result.tests_passed
+
+
+def test_capture_git_diff_survives_non_ascii_content(tmp_path: Path):
+    """text=True decoded git output with the console code page (cp1252); byte 0x81 of "Ё" is undefined there
+    and left stdout as None -> "'NoneType' object has no attribute 'strip'" (real qoldau report)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, check=True)
+    (repo / "kk.txt").write_text("бастапқы\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / "kk.txt").write_text("бастапқы\nқазақша өзгеріс «ғ» Ёж\n", encoding="utf-8")
+    (repo / "жаңа файл.txt").write_text("жаңа мазмұн ү ө\n", encoding="utf-8")
+    diff = CodexVerifier().capture_git_diff(str(repo))
+    assert "capture failed" not in diff
+    assert "қазақша өзгеріс" in diff
+    assert "жаңа файл.txt" in diff and "жаңа мазмұн" in diff
+
+
+def test_capture_git_diff_skips_noise_dirs(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / "node_modules" / "pkg").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "index.js").write_text("noise", encoding="utf-8")
+    (repo / "real.py").write_text("x = 1\n", encoding="utf-8")
+    diff = CodexVerifier().capture_git_diff(str(repo))
+    assert "real.py" in diff and "node_modules" not in diff

@@ -15,6 +15,27 @@ from agent_orchestrator.models import VerificationResult, VerificationVerdict
 
 logger = logging.getLogger("agent_orchestrator.codex_verifier")
 
+_NOISE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"}
+
+# One entry per test stack. Only the LAST run of each stack counts, so a retried command replaces a failed one,
+# while a repository with several stacks (Go backend + JS frontend) has to be green in every stack that was run.
+_RUNNER_KINDS = (
+    ("pytest", re.compile(r"\b(?:pytest|py\.test)\b", re.I)),
+    ("unittest", re.compile(r"\bunittest\b", re.I)),
+    ("go", re.compile(r"\bgo\s+test\b", re.I)),
+    ("js", re.compile(r"\b(?:npm\s+(?:test|run\s+test)|yarn\s+test|pnpm\s+test|vitest|jest|node\s+--test)\b", re.I)),
+    ("cargo", re.compile(r"\bcargo\s+test\b", re.I)),
+    ("dotnet", re.compile(r"\bdotnet\s+test\b", re.I)),
+    ("maven", re.compile(r"\bmvn\s+test\b", re.I)),
+    ("gradle", re.compile(r"\bgradle\s+test\b", re.I)),
+    ("tox", re.compile(r"\b(?:tox|nox)\b", re.I)),
+)
+
+
+def _is_noise_path(name: str) -> bool:
+    parts = name.replace("\\", "/").split("/")
+    return any(part in _NOISE_DIRS for part in parts) or name.endswith(".pyc")
+
 
 class CodexVerifier:
     """Executes a separate Codex process to independently verify results and run tests."""
@@ -37,51 +58,58 @@ class CodexVerifier:
         """Captures git diff of the workspace to inspect actual changes, including untracked files."""
         cwd_path = str(cwd)
         try:
-            # Check git status
+            # Bytes + explicit UTF-8: text=True decoded with the console code page, and a single undecodable
+            # byte (Cyrillic/Kazakh sources) left stdout as None -> "'NoneType' object has no attribute 'strip'".
             status_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "-c", "core.quotepath=false", "status", "--porcelain", "-z", "--untracked-files=all"],
+                stdin=subprocess.DEVNULL,
                 cwd=cwd_path,
                 capture_output=True,
-                text=True,
                 timeout=15,
             )
             if status_res.returncode != 0:
                 return "Not a git repository or git status failed."
 
-            if not status_res.stdout.strip():
+            entries = [e for e in status_res.stdout.decode("utf-8", errors="replace").split("\0") if e]
+            if not entries:
                 return "No changes in working tree (git status is clean)."
 
             diff_parts: List[str] = []
 
             # 1. Tracked modified diff
             diff_res = subprocess.run(
-                ["git", "diff", "HEAD"],
+                ["git", "-c", "core.quotepath=false", "diff", "HEAD"],
+                stdin=subprocess.DEVNULL,
                 cwd=cwd_path,
                 capture_output=True,
-                text=True,
                 timeout=30,
             )
-            if diff_res.stdout.strip():
-                diff_parts.append(diff_res.stdout)
+            diff_text = diff_res.stdout.decode("utf-8", errors="replace")
+            if diff_text.strip():
+                diff_parts.append(diff_text)
 
             # 2. Untracked new files (marked with '??')
-            for line in status_res.stdout.splitlines():
-                line = line.strip()
-                if line.startswith("??"):
-                    rel_path = line[2:].strip().strip('"')
-                    file_full = Path(cwd_path) / rel_path
-                    if file_full.is_file():
-                        try:
-                            content = file_full.read_text(encoding="utf-8", errors="replace")
-                            diff_parts.append(
-                                f"--- /dev/null\n+++ b/{rel_path} (New untracked file)\n{content}"
-                            )
-                        except Exception as fe:
-                            diff_parts.append(
-                                f"New untracked file {rel_path} (read error: {fe})"
-                            )
+            for entry in entries:
+                if not entry.startswith("?? "):
+                    continue
+                rel_path = entry[3:]
+                if _is_noise_path(rel_path):
+                    continue
+                file_full = Path(cwd_path) / rel_path
+                if file_full.is_file():
+                    try:
+                        content = file_full.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > 20000:
+                            content = content[:20000] + "\n[файл сокращён]"
+                        diff_parts.append(
+                            f"--- /dev/null\n+++ b/{rel_path} (New untracked file)\n{content}"
+                        )
+                    except Exception as fe:
+                        diff_parts.append(
+                            f"New untracked file {rel_path} (read error: {fe})"
+                        )
 
-            return "\n\n".join(diff_parts) if diff_parts else f"Changed files:\n{status_res.stdout}"
+            return "\n\n".join(diff_parts) if diff_parts else "Changed files:\n" + "\n".join(entries)
         except Exception as e:
             logger.warning(f"Failed to capture git diff: {e}")
             return f"Git diff capture failed: {e}"
@@ -205,7 +233,7 @@ FEEDBACK:
         try:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               capture_output=True, timeout=10, check=False)
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
             else:
                 os.killpg(pid, signal.SIGKILL)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -215,23 +243,22 @@ FEEDBACK:
     def _workspace_fingerprint(cwd: str) -> str | None:
         try:
             repo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
-                                  capture_output=True, timeout=15)
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
             if repo.returncode != 0 or repo.stdout.strip() != b"true":
                 return None
             head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd,
-                                  capture_output=True, timeout=15)
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
             diff_command = ["git", "diff", "HEAD"] if head.returncode == 0 else ["git", "diff"]
             diff = subprocess.run(diff_command, cwd=cwd,
-                                  capture_output=True, timeout=30, check=True).stdout
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=True).stdout
             status = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
-                                    cwd=cwd, capture_output=True, timeout=15, check=True).stdout
+                                    cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=15, check=True).stdout
             untracked = []
             for entry in status.split(b"\0"):
                 if not entry.startswith(b"?? "):
                     continue
                 name = entry[3:].decode("utf-8", errors="replace").replace("\\", "/")
-                parts = name.split("/")
-                if any(part in {"__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"} for part in parts) or name.endswith(".pyc"):
+                if _is_noise_path(name):
                     continue
                 untracked.append(name)
             digest = hashlib.sha256(diff + b"\0")
@@ -283,47 +310,68 @@ FEEDBACK:
                 json_seen = True
                 visit(value)
 
-        pattern = re.compile(
-            r"\b(?:pytest|py\.test|unittest|tox|nox)\b|\b-m\s+(?:pytest|unittest)\b|"
-            r"\b(?:npm\s+(?:test|run\s+test)|yarn\s+test|pnpm\s+test|go\s+test|"
-            r"cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b", re.I,
-        )
-        runs = [(cmd, code, output) for cmd, code, output in commands if pattern.search(cmd)]
-        if not runs:
+        last_by_kind: dict = {}
+        for command_text, code, output in commands:
+            kind = next((name for name, rx in _RUNNER_KINDS if rx.search(command_text)), None)
+            if kind:
+                last_by_kind[kind] = (command_text, code, output)
+        if not last_by_kind:
             return False, False, False, "", json_seen and not commands
-        command, code, output = runs[-1]
+        any_failed = False
+        all_passed = True
+        parts = []
+        for kind, (command, code, output) in last_by_kind.items():
+            summary, ok, summary_failed = CodexVerifier._run_outcome(kind, output)
+            run_failed = str(code) != "0" or summary_failed
+            run_passed = str(code) == "0" and ok and not run_failed
+            any_failed = any_failed or run_failed
+            all_passed = all_passed and run_passed
+            parts.append(f"{command[:200]} (код {code}): {(summary or 'нет итоговой строки')[:300]}")
+        passed = all_passed and not any_failed
+        return True, passed, any_failed, " | ".join(parts), json_seen and not commands
+
+    @staticmethod
+    def _run_outcome(kind: str, output: str) -> tuple[str, bool, bool]:
+        """(summary line, passed according to the runner's own summary, summary reports failures)."""
         lines = [line.strip() for line in output.splitlines()]
-        summary = ""
-        passed = False
-        summary_failed = False
-        if re.search(r"\b(?:pytest|py\.test)\b", command, re.I):
+        if kind == "pytest":
             summaries = [line.strip("= ") for line in lines
                          if re.match(r"^\s*=*\s*\d+\s+(?:passed|failed|errors?)\b", line, re.I)]
-            if summaries:
-                summary = summaries[-1]
-                counts = {kind.lower(): int(number) for number, kind in re.findall(
-                    r"\b(\d+)\s+(passed|failed|errors?)\b", summary, re.I)}
-                summary_failed = counts.get("failed", 0) > 0 or counts.get("error", 0) > 0 or counts.get("errors", 0) > 0
-                passed = counts.get("passed", 0) > 0 and not summary_failed
-        elif re.search(r"\bunittest\b", command, re.I):
+            if not summaries:
+                return "", False, False
+            counts = {k.lower(): int(n) for n, k in re.findall(r"\b(\d+)\s+(passed|failed|errors?)\b", summaries[-1], re.I)}
+            bad = counts.get("failed", 0) > 0 or counts.get("error", 0) > 0 or counts.get("errors", 0) > 0
+            return summaries[-1], counts.get("passed", 0) > 0 and not bad, bad
+        if kind == "unittest":
             summaries = [line for line in lines if re.fullmatch(r"OK(?:\s*\([^)]*\))?|FAILED\s*\([^)]*\)", line, re.I)]
-            if summaries:
-                summary = summaries[-1]
-                ran = re.findall(r"^Ran\s+(\d+)\s+tests?\b", output, re.I | re.M)
-                summary_failed = bool(re.match(r"FAILED\b", summary, re.I))
-                passed = bool(re.match(r"OK\b", summary, re.I)) and (not ran or int(ran[-1]) > 0)
-        else:
-            summaries = [line.strip("= ") for line in lines
-                         if re.match(r"^\s*=*\s*(?:tests?:\s*)?(?:\d+\s+passed|passed\b)", line, re.I)]
-            if summaries:
-                summary = summaries[-1]
-                summary_failed = any(int(number) > 0 for number in re.findall(
-                    r"\b(\d+)\s+(?:failed|errors?)\b", summary, re.I))
-                passed = not summary_failed
-        failed = str(code) != "0" or summary_failed
-        passed = str(code) == "0" and passed and not failed
-        evidence = f"{command[:200]} (код {code}): {(summary or 'нет итоговой строки')[:300]}"
-        return True, passed, failed, evidence, json_seen and not commands
+            if not summaries:
+                return "", False, False
+            ran = re.findall(r"^Ran\s+(\d+)\s+tests?\b", output, re.I | re.M)
+            bad = bool(re.match(r"FAILED\b", summaries[-1], re.I))
+            ok = bool(re.match(r"OK\b", summaries[-1], re.I)) and (not ran or int(ran[-1]) > 0)
+            return summaries[-1], ok, bad
+        if kind == "go":
+            # `go test ./...` prints one line per package and never a total.
+            ok_lines = [line for line in lines if re.match(r"^ok\s+\S+", line)]
+            bad_lines = [line for line in lines
+                         if re.match(r"^(?:FAIL\b|--- FAIL:|panic:)", line)
+                         or "[build failed]" in line or "[setup failed]" in line]
+            if not ok_lines and not bad_lines:
+                return "", False, False
+            summary = f"go test: пакетов ok — {len(ok_lines)}, ошибок — {len(bad_lines)}"
+            return summary, bool(ok_lines) and not bad_lines, bool(bad_lines)
+        # node:test (`# pass N` / `ℹ pass N`), then Jest/Vitest/generic summaries.
+        node_pass = re.findall(r"^(?:#|ℹ)\s*pass\s+(\d+)", output, re.I | re.M)
+        node_fail = re.findall(r"^(?:#|ℹ)\s*fail\s+(\d+)", output, re.I | re.M)
+        if node_pass:
+            failed_n = int(node_fail[-1]) if node_fail else 0
+            return f"pass {node_pass[-1]}, fail {failed_n}", int(node_pass[-1]) > 0 and failed_n == 0, failed_n > 0
+        summaries = [line.strip("= ") for line in lines
+                     if re.match(r"^\s*=*\s*(?:tests?:?\s+)?(?:\d+\s+passed|passed\b)", line, re.I)]
+        if not summaries:
+            return "", False, False
+        bad = any(int(n) > 0 for n in re.findall(r"\b(\d+)\s+(?:failed|errors?)\b", summaries[-1], re.I))
+        return summaries[-1], not bad, bad
 
     def parse_verification_output(
         self,
@@ -368,9 +416,16 @@ FEEDBACK:
         if failed and verdict == VerificationVerdict.PASSED:
             verdict = VerificationVerdict.RETRY_NEEDED
             issues.append("Зафиксированы проваленные тесты. Вердикт переведён в RETRY_NEEDED.")
-        if tests_required and not passed and not failed and verdict in (VerificationVerdict.PASSED, VerificationVerdict.RETRY_NEEDED):
-            verdict = VerificationVerdict.FAILED
-            issues.append("Тесты требуются, но успешный запуск не подтверждён событиями верификатора.")
+        if tests_required and not passed and not failed:
+            if verdict == VerificationVerdict.PASSED:
+                verdict = VerificationVerdict.FAILED
+                issues.append("Тесты требуются, но успешный запуск не подтверждён событиями верификатора.")
+            elif verdict == VerificationVerdict.RETRY_NEEDED:
+                # Nothing is approved here and the findings are fixable: keep the retry loop alive.
+                issues.append(
+                    "Тесты требуются, но успешный запуск не подтверждён событиями верификатора; "
+                    "замечания переданы на исправление."
+                )
         return VerificationResult(
             verdict=verdict, feedback=feedback, exit_code=exit_code, raw_output=raw_output,
             issues_found=issues, tests_executed=executed, tests_passed=passed,
