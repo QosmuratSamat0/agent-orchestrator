@@ -99,6 +99,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space
     <a href="#how">How it works</a>
     <a class="opt" href="#real-run">Real run</a>
     <a class="opt" href="#dashboard">Dashboard</a>
+    <a class="opt" href="#mcp">MCP</a>
     <a href="#start">Quick start</a>
     <a href="https://github.com/QosmuratSamat0/agent-orchestrator">GitHub</a>
   </div>
@@ -114,7 +115,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space
   <div class="chips">
     <span class="chip">Python 3.11 · standard library only</span>
     <span class="chip">SQLite, crash-safe</span>
-    <span class="chip">260+ tests</span>
+    <span class="chip">300+ tests</span>
     <span class="chip">Verified with the real tools</span>
     <span class="chip">MIT license</span>
   </div>
@@ -189,7 +190,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space
 
 <section id="verified"><div class="wrap">
   <h2>Tested against the real tools</h2>
-  <p class="sub">Over 260 automated tests use mocks and fake programs. Mocks can be wrong, so every claim was also checked with real Agent-Bridge, Antigravity and Codex on a sandbox repo. The real runs found four bugs that all the mocked tests had missed.</p>
+  <p class="sub">Over 300 automated tests use mocks and fake programs. Mocks can be wrong, so every claim was also checked with real Agent-Bridge, Antigravity and Codex on a sandbox repo. The real runs found four bugs that all the mocked tests had missed.</p>
   <div class="tablewrap"><table>
     <thead><tr><th>Real check</th><th>Result</th><th>What it proved or fixed</th></tr></thead>
     <tbody>
@@ -210,6 +211,48 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space
   <p class="sub">Run <code>agent-orchestrator dashboard --open</code> to follow every task in your browser: status, attempt, time left, verifier notes, the event history and the live agent journal. It runs only on your own computer, reads your local database, and never starts an agent itself.</p>
   <img class="shot" src="assets/dashboard.png" width="1280" height="860" alt="The local dashboard: a list of tasks on the left; on the right a completed task with verdict passed, the verifier's notes, its events and the live Antigravity journal">
   <p class="note">Security by design: it listens on 127.0.0.1 only, rejects foreign <code>Host</code> headers (DNS rebinding), inserts all task text as plain text, and the one write action, cancel, requires a secret token created at startup.</p>
+</div></section>
+
+<section id="mcp"><div class="wrap">
+  <h2>Drive it from your Codex chat (MCP)</h2>
+  <p class="sub">The orchestrator ships a small local MCP server. Add it to Codex in VS Code and you can start a task, check on it and read the report from the chat you are already in, without a second terminal. The chat only <em>controls</em> the work. Writing and verifying are still done by Antigravity and a separate Codex run.</p>
+  <div class="two">
+    <div class="steps">
+      <div><h3>You ask in the chat</h3>
+        <p>Something like: "Run via the orchestrator: fix the bug in <code>calc.py</code>, tests must pass." Codex calls the <code>start_task</code> tool with your prompt, the acceptance criteria and the absolute path of the project.</p></div>
+      <div><h3>A background worker takes over</h3>
+        <p>The server saves the task in SQLite, starts a separate worker process with its input closed, and returns the task ID at once. The worker runs the normal loop: dispatch, wait, verify, retry.</p></div>
+      <div><h3>You check when you like</h3>
+        <p><code>get_status</code> and <code>get_report</code> only read the database, so they answer instantly and never disturb the run. The task is shown with the same status the CLI and the dashboard use.</p></div>
+      <div><h3>Verification stays independent</h3>
+        <p>A fresh <code>codex exec</code> checks the diff and runs the tests. It does not see your chat, and your chat cannot approve its own work.</p></div>
+    </div>
+    <div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>start_task</code></td><td>Create a task and start it in the background. Returns the ID immediately.</td></tr>
+          <tr><td><code>get_status</code></td><td>Status, attempt, verdict and error. Shows whether the owning process is still alive.</td></tr>
+          <tr><td><code>list_tasks</code></td><td>The most recent tasks, up to 50.</td></tr>
+          <tr><td><code>get_report</code></td><td>The finished task's report: verdict, test evidence, diff and history.</td></tr>
+          <tr><td><code>cancel_task</code></td><td>Record a cancel. The running worker stops within about 10 seconds.</td></tr>
+          <tr><td><code>recover_task</code></td><td>Close or verify a task whose process died. It never sends the work to the agent again.</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </div>
+  <h3 style="margin:30px 0 0">Add it to Codex</h3>
+  <p class="caption" style="margin-top:4px">Reinstall the package with <code>python -m pip install -e .</code>, then add this to your Codex MCP settings (or <code>~/.codex/config.toml</code>) and restart the extension. Use your own absolute paths.</p>
+  <pre class="code">[mcp_servers.agent_orchestrator]
+command = "&lt;path-to-python&gt;/python.exe"
+args = ["-m", "agent_orchestrator.mcp_server", "--config", "&lt;repo&gt;/config.toml"]
+cwd = "&lt;repo&gt;"</pre>
+  <div class="cards" style="margin-top:22px">
+    <div class="card"><div class="ic">⧉</div><h3>Survives a window restart</h3><p>The worker is its own process, not a thread of the chat's server. On Windows it asks to leave the extension's job object, and falls back if the system refuses.</p></div>
+    <div class="card"><div class="ic">♥</div><h3>Knows if its owner died</h3><p>Each running task records its owner process and a heartbeat. <code>get_status</code> reports <code>owner_alive</code>; a dead owner can be recovered, an unknown one is never touched.</p></div>
+    <div class="card"><div class="ic">1</div><h3>One task at a time</h3><p>A second <code>start_task</code> is refused while one is active, so two agents never edit the same project at once.</p></div>
+  </div>
+  <p class="note">Honest limits: the heartbeat proves the process is alive, not that the agent is making progress; the 45-minute budget covers a stuck run. The worker was tested by killing it and recovering with fake tools. A real restart of VS Code has not been tested yet, so whether the extension kills child processes is still an open question.</p>
 </div></section>
 
 <section id="start"><div class="wrap">

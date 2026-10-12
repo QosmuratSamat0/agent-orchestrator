@@ -95,6 +95,7 @@ def test_http_page_and_api(server, setup):
     assert "secret-token" in page and "__DASHBOARD_TOKEN__" not in page
     assert "default-src 'none'" in response.getheader("Content-Security-Policy")
     assert "http://" not in page and "https://" not in page  # no external resources
+    assert all(label in page for label in ("Последний час", "Сегодня", "Раньше"))  # task list groups
     status, ctype, body, _ = request(srv, "GET", "/api/tasks")
     assert status == 200 and ctype.startswith("application/json")
     titles = [t["title"] for t in json.loads(body)["tasks"]]

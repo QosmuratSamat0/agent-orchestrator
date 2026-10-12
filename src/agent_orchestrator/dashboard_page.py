@@ -29,6 +29,7 @@ main { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 16px
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 #list { padding: 6px; max-height: calc(100vh - 110px); overflow: auto; }
 #list .empty { padding: 16px; color: var(--muted); }
+#list .grp { padding: 10px 10px 4px; color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
 .item { display: block; width: 100%; text-align: left; border: 0; background: none; color: inherit; font: inherit;
         padding: 10px 12px; border-radius: 8px; cursor: pointer; }
 .item:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
@@ -118,19 +119,35 @@ function setConn(ok) {
 
 function renderList() {
   const list = document.getElementById("list");
+  const listScroll = list.scrollTop;
   list.replaceChildren();
   if (!tasks.length) { list.append(el("div", "empty", "Задач пока нет. Запустите: agent-orchestrator run …")); return; }
-  for (const item of tasks) {
-    const button = el("button", "item" + (item.id === selectedId ? " sel" : ""));
-    const title = el("div", "t");
-    title.append(el("i", "dot s-" + item.status), el("span", "", item.title || "Без названия"));
-    const left = liveRemaining(item);
-    const meta = (STATUS_RU[item.status] || item.status) + " · попытка " + item.attempt +
-                 (left !== null ? " · осталось " + fmtDur(left) : "") + " · " + item.id.slice(0, 8);
-    button.append(title, el("div", "m", meta));
-    button.addEventListener("click", () => select(item.id));
-    list.append(button);
+  const now = Date.now();
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const groups = [["Последний час", []], ["Сегодня", []], ["Раньше", []]];
+  const created = (item) => new Date(item.created_at).getTime() || 0;
+  for (const item of tasks.slice().sort((a, b) => created(b) - created(a))) {
+    const at = created(item);
+    groups[now - at <= 3600 * 1000 ? 0 : at >= midnight.getTime() ? 1 : 2][1].push(item);
   }
+  for (const [label, items] of groups) {
+    if (!items.length) continue;
+    list.append(el("div", "grp", label + " · " + items.length));
+    for (const item of items) appendItem(list, item);
+  }
+  list.scrollTop = listScroll;
+}
+
+function appendItem(list, item) {
+  const button = el("button", "item" + (item.id === selectedId ? " sel" : ""));
+  const title = el("div", "t");
+  title.append(el("i", "dot s-" + item.status), el("span", "", item.title || "Без названия"));
+  const left = liveRemaining(item);
+  const meta = (STATUS_RU[item.status] || item.status) + " · попытка " + item.attempt +
+               (left !== null ? " · осталось " + fmtDur(left) : "") + " · " + item.id.slice(0, 8);
+  button.append(title, el("div", "m", meta));
+  button.addEventListener("click", () => select(item.id));
+  list.append(button);
 }
 
 function kv(label, value, big) {
@@ -139,10 +156,17 @@ function kv(label, value, big) {
   return box;
 }
 
+let lastDetailSig = null;
 function renderDetail() {
   const pane = document.getElementById("detail");
-  if (!detail) { pane.replaceChildren(el("div", "placeholder", "Выберите задачу слева")); return; }
+  if (!detail) { lastDetailSig = null; pane.replaceChildren(el("div", "placeholder", "Выберите задачу слева")); return; }
+  // Rebuilding the pane every poll reset the scroll position of the page and of the log; skip it when nothing changed.
+  const sig = JSON.stringify(Object.assign({}, detail, { remaining_sec: 0 }));
+  if (sig === lastDetailSig && document.getElementById("log")) return;
+  lastDetailSig = sig;
   const keepLog = document.getElementById("log");
+  const logScroll = keepLog ? keepLog.scrollTop : 0;
+  const pageScroll = window.scrollY;
   pane.replaceChildren();
   const head = el("div", "head");
   head.append(el("h2", "", detail.title || "Без названия"),
@@ -196,7 +220,19 @@ function renderDetail() {
   bar.append(follow);
   pane.append(bar);
   const log = keepLog || el("pre"); log.id = "log";
+  if (!keepLog) {
+    log.addEventListener("scroll", () => {
+      // Scrolling up pauses following; returning to the bottom resumes it.
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+      window.__follow = atBottom;
+      const checkbox = document.getElementById("follow");
+      if (checkbox) checkbox.checked = atBottom;
+    });
+  }
   pane.append(log);
+  // A node that was detached loses its scrollTop: put both positions back.
+  log.scrollTop = window.__follow !== false ? log.scrollHeight : logScroll;
+  window.scrollTo(0, pageScroll);
 }
 
 async function refreshLog() {
@@ -227,7 +263,7 @@ async function refresh() {
   } catch (error) { setConn(false); }
 }
 
-function select(id) { selectedId = id; detail = null; history.replaceState(null, "", "#" + encodeURIComponent(id)); refresh(); }
+function select(id) { selectedId = id; detail = null; lastDetailSig = null; window.__follow = true; history.replaceState(null, "", "#" + encodeURIComponent(id)); refresh(); }
 
 async function cancelTask(button) {
   if (!confirm("Отменить задачу «" + (detail.title || detail.id.slice(0, 8)) + "»?")) return;
