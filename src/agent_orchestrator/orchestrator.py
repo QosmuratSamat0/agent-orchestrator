@@ -17,7 +17,7 @@ from agent_orchestrator.models import (
     VerificationResult,
     VerificationVerdict,
 )
-from agent_orchestrator.model_router import ModelRouter
+from agent_orchestrator.model_router import ModelRouter, dispatch_effort
 from agent_orchestrator.progress import ProgressFeed
 from agent_orchestrator.repository import ConcurrencyLimitError, TaskRepository
 from agent_orchestrator.retry_controller import RetryController
@@ -305,7 +305,7 @@ class Orchestrator:
                         message=current_prompt,
                         cwd=task.cwd,
                         model=task.model,
-                        effort=task.effort,
+                        effort=dispatch_effort(task.model, task.effort),
                         title=f"{task.title} (Attempt {task.retry_count + 1})",
                         request_id=_attempt_request_id(task.request_id, task.retry_count),
                         session_id=task.bridge_session_id,

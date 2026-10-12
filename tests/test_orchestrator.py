@@ -1210,3 +1210,42 @@ def test_report_write_failure_does_not_change_terminal_status(repo, mock_bridge,
 
 
 
+
+
+def test_dispatch_never_sends_effort_with_leveled_slug(
+    repo, mock_bridge: MockBridgeClient, mock_verifier: MockCodexVerifier, waiter, tmp_path: Path
+):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier, waiter=waiter)
+    task = orchestrator.create_task(title="Leveled", prompt="напиши pytest тесты для эндпоинта", cwd=str(tmp_path))
+    # Legacy row: leveled slug with a conflicting stored effort (what broke the second real run).
+    task.effort = "medium"
+    repo.update_task(task)
+
+    finished = orchestrator.run_task(task.id)
+
+    assert finished.status == TaskStatus.COMPLETED
+    assert mock_bridge.dispatched_tasks[0]["model"] == "gemini-3.8-flash-high"
+    assert mock_bridge.dispatched_tasks[0]["effort"] is None
+
+
+def test_dispatch_sends_explicit_effort_for_unleveled_slug(
+    repo, mock_bridge: MockBridgeClient, mock_verifier: MockCodexVerifier, waiter, tmp_path: Path
+):
+    orchestrator = Orchestrator(repository=repo, bridge=mock_bridge, verifier=mock_verifier, waiter=waiter)
+    task = orchestrator.create_task(
+        title="Claude", prompt="простая задача", model="claude-sonnet-4-6", effort="high", cwd=str(tmp_path)
+    )
+    orchestrator.run_task(task.id)
+    assert mock_bridge.dispatched_tasks[0]["effort"] == "high"
+
+
+def test_mock_bridge_rejects_leveled_slug_with_effort(mock_bridge: MockBridgeClient):
+    import uuid
+
+    resp = mock_bridge.dispatch_task(
+        agent="antigravity", message="m", cwd=".", model="gemini-3.8-flash-high",
+        effort="medium", request_id=str(uuid.uuid4()),
+    )
+    assert resp["ok"] is False
+    assert "conflicts with --effort" in resp["error"]
+    assert mock_bridge.dispatched_tasks == []

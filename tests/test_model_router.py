@@ -84,3 +84,46 @@ def test_fallback_on_unverified_model():
     assert sel.is_fallback is True
     assert sel.model == "gemini-3.8-flash-high"
     assert "fallback" in sel.reason.lower()
+
+
+@pytest.mark.parametrize("slug,expected", [
+    ("gemini-3.8-flash-high", ("gemini-3.8-flash", "high")),
+    ("gpt-oss-120b-medium", ("gpt-oss-120b", "medium")),
+    ("gemini-3.1-pro-low", ("gemini-3.1-pro", "low")),
+    ("claude-sonnet-4-6", ("claude-sonnet-4-6", None)),
+    ("claude-opus-4-6-thinking", ("claude-opus-4-6-thinking", None)),
+])
+def test_split_model_level(slug, expected):
+    from agent_orchestrator.model_router import split_model_level
+    assert split_model_level(slug) == expected
+
+
+def test_policy_effort_comes_from_slug(model_router: ModelRouter):
+    sel = model_router.select_model("напиши pytest тесты для эндпоинта")
+    assert sel.model == "gemini-3.8-flash-high"
+    assert sel.effort == "high"
+
+
+def test_manual_effort_switches_to_sibling_slug(model_router: ModelRouter):
+    sel = model_router.select_model("напиши pytest тесты для эндпоинта", manual_effort="low")
+    assert (sel.model, sel.effort) == ("gemini-3.8-flash-low", "low")
+    sel = model_router.select_model("x", manual_model="gemini-3.8-flash-high", manual_effort="medium")
+    assert (sel.model, sel.effort) == ("gemini-3.8-flash-medium", "medium")
+
+
+def test_manual_effort_without_sibling_is_ignored(model_router: ModelRouter):
+    sel = model_router.select_model("простая задача", manual_model="gemini-3.1-pro-high", manual_effort="medium")
+    assert (sel.model, sel.effort) == ("gemini-3.1-pro-high", "high")
+    assert "проигнорирован" in sel.reason
+
+
+def test_unleveled_slug_has_effort_only_when_explicit(model_router: ModelRouter):
+    assert model_router.select_model("простая задача", manual_model="claude-sonnet-4-6").effort == ""
+
+
+def test_dispatch_effort_rule():
+    from agent_orchestrator.model_router import dispatch_effort
+    assert dispatch_effort("gemini-3.8-flash-high", "medium") is None
+    assert dispatch_effort("gemini-3.8-flash-high", "high") is None
+    assert dispatch_effort("claude-sonnet-4-6", "high") == "high"
+    assert dispatch_effort("claude-sonnet-4-6", "") is None

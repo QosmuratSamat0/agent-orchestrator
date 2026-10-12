@@ -69,7 +69,7 @@ class RetryController:
             f"- **ID задачи:** `{task.id}`",
             f"- **Название:** {task.title or 'Без названия'}",
             f"- **Итоговый статус:** `{task.status.value.upper()}`",
-            f"- **Использованная модель Antigravity:** `{task.model}` (effort: `{task.effort}`)",
+            f"- **Использованная модель Antigravity:** `{task.model}` (effort: `{task.effort or 'по умолчанию'}`)",
             f"- **Количество попыток / повторов:** {task.retry_count}",
             f"- **Рабочий каталог:** `{task.cwd}`",
             f"- **Время создания:** {task.created_at}",

@@ -28,6 +28,24 @@ VERIFIED_AGY_MODELS: Set[str] = {
     "gpt-oss-120b-medium",
 }
 
+MODEL_LEVELS = ("low", "medium", "high")
+
+
+def split_model_level(model: str) -> Tuple[str, Optional[str]]:
+    """Splits 'gemini-3.8-flash-high' into ('gemini-3.8-flash', 'high'); level is None if the slug has none."""
+    base, sep, level = (model or "").rpartition("-")
+    if sep and base and level in MODEL_LEVELS:
+        return base, level
+    return model, None
+
+
+def dispatch_effort(model: str, effort: Optional[str]) -> Optional[str]:
+    """Effort to send to Antigravity: never for a slug that already encodes its level (agy rejects the pair)."""
+    _, level = split_model_level(model)
+    if level:
+        return None
+    return effort or None
+
 
 class ModelRouter:
     """Selects the optimal Antigravity model and effort level based on task complexity, risk, and verified models."""
@@ -66,6 +84,21 @@ class ModelRouter:
     @property
     def available_models(self) -> Set[str]:
         return set(self._available_models)
+
+    def _resolve_level(self, model: str, manual_effort: Optional[str]) -> Tuple[str, str, str]:
+        """The slug is the single source of truth for the level. Returns (model, effort, note)."""
+        base, level = split_model_level(model)
+        if not level:
+            return model, manual_effort or "", ""
+        if manual_effort and manual_effort != level:
+            sibling = f"{base}-{manual_effort}"
+            if sibling in self._available_models:
+                return sibling, manual_effort, f" Запрошен уровень '{manual_effort}': выбрана модель {sibling}."
+            return model, level, (
+                f" Запрошенный уровень '{manual_effort}' проигнорирован: "
+                f"у модели {model} нет варианта с этим уровнем."
+            )
+        return model, level, ""
 
     def classify_complexity(self, prompt: str, acceptance_criteria: str = "") -> Tuple[TaskComplexity, str]:
         """Deterministic rule-based complexity classifier evaluating size, ambiguity, and risk."""
@@ -126,42 +159,37 @@ class ModelRouter:
                 logger.warning(
                     f"Manual model '{manual_model}' not found in available models. Falling back."
                 )
-                model_to_use = self.config.fallback
+                model_to_use, effort, note = self._resolve_level(self.config.fallback, manual_effort)
                 return ModelSelection(
                     model=model_to_use,
-                    effort=manual_effort or "medium",
+                    effort=effort,
                     complexity=complexity,
-                    reason=f"Ручной выбор '{manual_model}' недоступен. Применён fallback: {model_to_use}",
+                    reason=f"Ручной выбор '{manual_model}' недоступен. Применён fallback: {model_to_use}.{note}",
                     is_fallback=True,
                     is_override=True,
                 )
+            model_to_use, effort, note = self._resolve_level(model_to_use, manual_effort)
             return ModelSelection(
                 model=model_to_use,
-                effort=manual_effort or "medium",
+                effort=effort,
                 complexity=complexity,
-                reason=f"Ручное переопределение пользователем: {manual_model}",
+                reason=f"Ручное переопределение пользователем: {manual_model}.{note}",
                 is_override=True,
             )
 
-        # 2. Deterministic policy mapping
+        # 2. Deterministic policy mapping (the level comes from the configured slug)
         target_model: str
-        target_effort: str
 
         if complexity == TaskComplexity.TRIVIAL:
             target_model = self.config.trivial
-            target_effort = "low"
         elif complexity == TaskComplexity.SIMPLE:
             target_model = self.config.simple
-            target_effort = "low"
         elif complexity == TaskComplexity.MODERATE:
             target_model = self.config.moderate
-            target_effort = "medium"
         elif complexity == TaskComplexity.COMPLEX:
             target_model = self.config.complex
-            target_effort = "high"
         else:  # EXPERT
             target_model = self.config.expert
-            target_effort = "high"
 
         # 3. Availability check & Fallback
         is_fallback = False
@@ -173,8 +201,8 @@ class ModelRouter:
             is_fallback = True
             reason += f" (Модель по умолчанию недоступна, задействован fallback {target_model})"
 
-        if manual_effort:
-            target_effort = manual_effort
+        target_model, target_effort, note = self._resolve_level(target_model, manual_effort)
+        reason += note
 
         logger.info(
             f"Model selected: {target_model} (effort={target_effort}, complexity={complexity.value}). Reason: {reason}"

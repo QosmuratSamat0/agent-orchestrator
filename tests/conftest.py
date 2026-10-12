@@ -18,7 +18,7 @@ from agent_orchestrator.models import (
     VerificationResult,
     VerificationVerdict,
 )
-from agent_orchestrator.model_router import ModelRouter
+from agent_orchestrator.model_router import ModelRouter, split_model_level
 from agent_orchestrator.repository import TaskRepository
 from agent_orchestrator.retry_controller import RetryController
 from agent_orchestrator.waiter import NonLLMWaiter
@@ -73,6 +73,14 @@ class MockBridgeClient(BridgeClient):
                     "error": "ValueError: request_id must be a UUID",
                     "error_type": "ValueError",
                 }
+        _, level = split_model_level(model or "")
+        if level and effort:
+            # agy rejects an explicit effort for a slug that already encodes its level.
+            return {
+                "ok": False,
+                "error": f"invalid model selection: --model {model} conflicts with --effort={effort}",
+                "error_type": "ValueError",
+            }
         self._counter += 1
         task_id = f"mock_task_{self._counter}"
         sess_id = session_id or f"mock_sess_{self._counter}"

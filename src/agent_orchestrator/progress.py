@@ -73,7 +73,7 @@ class ProgressFeed:
             if deadline_epoch is not None:
                 seconds = max(0, int(deadline_epoch - (now if now is not None else time.time())))
                 remaining = f"{seconds // 60:02}:{seconds % 60:02}"
-            silent = f", тишина {resp['silent_for_sec']} с" if "silent_for_sec" in resp else ""
+            silent = f", тишина {resp['silent_for_sec']} с" if resp.get("silent_for_sec") is not None else ""
             self.log(task, f"статус {status}{silent}, прошло {int(tick - first)} с, осталось {remaining}")
 
             activity = resp.get("recent_activity")

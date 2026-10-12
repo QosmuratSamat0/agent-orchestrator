@@ -311,3 +311,15 @@ def test_watch_tails_only_new_lines_until_terminal(tmp_path, monkeypatch, capsys
     assert output.count("Первая строка") == 1
     assert output.count("Вторая строка") == 1
     assert "Статус: completed" in output
+
+
+def test_none_silent_for_sec_is_not_printed(tmp_path):
+    from agent_orchestrator.models import Task
+    from agent_orchestrator.progress import ProgressFeed
+
+    feed = ProgressFeed(log_dir=tmp_path, poll_interval_sec=0)
+    task = Task(title="t", prompt="p")
+    feed.on_wait_progress(task, object(), {"status": "running", "silent_for_sec": None})
+    text = (tmp_path / f"{task.id[:8]}.log").read_text(encoding="utf-8")
+    assert "статус running" in text
+    assert "None" not in text and "тишина" not in text

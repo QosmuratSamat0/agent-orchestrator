@@ -72,7 +72,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
 
         print(f"ID задачи: {task.id}")
-        print(f"Выбранная модель: {task.model} (effort: {task.effort})")
+        print(f"Выбранная модель: {task.model} (effort: {task.effort or 'по умолчанию'})")
         print(f"Обоснование:      {task.model_reason}")
 
         completed_task = orchestrator.run_task(task.id, on_step_callback=print_step)
@@ -109,7 +109,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
             effort=args.effort,
         )
         print(f"Задача добавлена в очередь! ID: {task.id}")
-        print(f"Модель: {task.model} (effort: {task.effort})")
+        print(f"Модель: {task.model} (effort: {task.effort or 'по умолчанию'})")
     finally:
         orchestrator.close()
 
@@ -127,7 +127,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         print("=" * 50)
         print(f"Задача:    {task.title} ({task.id})")
         print(f"Статус:    {task.status.value}")
-        print(f"Модель:    {task.model} ({task.effort})")
+        print(f"Модель:    {task.model} ({task.effort or 'по умолчанию'})")
         print(f"Попыток:   {task.retry_count}")
         print(f"Создана:   {task.created_at}")
         print(f"Обновлена: {task.updated_at}")
