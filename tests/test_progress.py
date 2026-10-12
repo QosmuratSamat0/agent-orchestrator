@@ -368,3 +368,18 @@ def test_feed_collapses_identical_consecutive_transcript_lines(tmp_path):
     lines = (tmp_path / f"{task.id[:8]}.log").read_text(encoding="utf-8").splitlines()
     assert sum("ответ агента [DONE]" in line for line in lines) == 1
     assert any("инструмент view_file [DONE]" in line for line in lines)
+
+
+def test_bare_activity_kinds_are_not_logged(tmp_path):
+    # Real Bridge recent_activity for agy is often just the event kind ("raw", "tool_call").
+    from agent_orchestrator.models import Task
+    from agent_orchestrator.progress import ProgressFeed
+
+    feed = ProgressFeed(log_dir=tmp_path, poll_interval_sec=0)
+    task = Task(title="t", prompt="p")
+    feed.on_wait_progress(task, object(), {"status": "running", "recent_activity": ["raw"]})
+    feed.on_wait_progress(task, object(), {"status": "queued", "recent_activity": ["tool_call"]})
+    feed.on_wait_progress(task, object(), {"status": "running", "recent_activity": ["Файл изменён"]})
+    text = (tmp_path / f"{task.id[:8]}.log").read_text(encoding="utf-8")
+    assert "активность: raw" not in text and "активность: tool_call" not in text
+    assert "активность: Файл изменён" in text

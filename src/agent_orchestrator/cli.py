@@ -288,6 +288,32 @@ def cmd_watch(args: argparse.Namespace) -> None:
         print("Просмотр остановлен.")
 
 
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    from agent_orchestrator.dashboard import LOOPBACK_HOSTS, DashboardApp, create_server
+
+    config = OrchestratorConfig.load(args.config)
+    db_path = Path(config.db_path).resolve()
+    if not db_path.is_file():
+        print(f"База данных не найдена: {db_path}")
+        raise SystemExit(1)
+    if args.host not in LOOPBACK_HOSTS:
+        print(f"Внимание: панель будет доступна по сети на {args.host}. Используйте это только в доверенной сети.")
+    server = create_server(DashboardApp(config), host=args.host, port=args.port)
+    host = "localhost" if args.host in LOOPBACK_HOSTS else args.host
+    url = f"http://{host}:{server.server_address[1]}/"
+    print(f"Панель запущена: {url}  (Ctrl+C — остановить)")
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Панель остановлена.")
+    finally:
+        server.server_close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agent-orchestrator",
@@ -344,6 +370,11 @@ def main() -> None:
     p_watch.add_argument("--interval", type=float, default=2.0, metavar="SEC", help="Интервал обновления в секундах")
     p_watch.add_argument("--once", action="store_true", help="Показать один снимок")
 
+    p_dash = subparsers.add_parser("dashboard", help="Локальная веб-панель задач и живого журнала")
+    p_dash.add_argument("--host", default="127.0.0.1", help="Адрес (по умолчанию только этот компьютер)")
+    p_dash.add_argument("--port", type=int, default=8765, help="Порт (по умолчанию 8765)")
+    p_dash.add_argument("--open", action="store_true", help="Открыть панель в браузере")
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
@@ -357,6 +388,7 @@ def main() -> None:
         "models": cmd_models,
         "report": cmd_report,
         "watch": cmd_watch,
+        "dashboard": cmd_dashboard,
     }
 
     cmd_fn = dispatch_table.get(args.command)

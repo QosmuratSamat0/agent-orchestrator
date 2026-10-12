@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
+import re
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -80,7 +81,8 @@ class ProgressFeed:
             activity = resp.get("recent_activity")
             if isinstance(activity, list) and activity:
                 newest = str(activity[-1])
-                if newest != self._last_activity.get(task.id):
+                # Bare event kinds ("raw", "tool_call") carry no information; the transcript tail shows the details.
+                if not re.fullmatch(r"[a-z_]+", newest) and newest != self._last_activity.get(task.id):
                     self._last_activity[task.id] = newest
                     self.log(task, f"активность: {newest}")
 

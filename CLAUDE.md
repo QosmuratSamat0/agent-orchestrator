@@ -28,4 +28,6 @@ python -m pytest tests/test_orchestrator.py -v -rs
 
 `progress.py` пишет ленту в `[progress].log_dir` или рядом с БД в `orchestrator_logs`; интервал задан `poll_interval_sec`. CLI `watch [ID] [--once]` читает БД и лог, показывает время событий в местном часовом поясе и не создаёт отсутствующую БД. CLI `cancel` помечает задачу в БД без обращения к новому экземпляру Bridge. Живой оркестратор замечает отмену при следующей проверке; если он не работает, агент требует ручной проверки. Внутренний `cancel_task()` по умолчанию по-прежнему уведомляет свой Bridge.
 
+`dashboard.py` (+ `dashboard_page.py`) — локальная веб-панель `cli dashboard`: только чтение SQLite/логов, слушает 127.0.0.1, проверяет `Host`, отмена только с токеном запуска; не создаёт Orchestrator до отмены и не запускает процессы. `docs/` — статический сайт для GitHub Pages (main → /docs); `docs/assets/dashboard.png` снят с реальной панели. Лицензия MIT.
+
 `config.py` загружает путь из `--config`, `ORCHESTRATOR_CONFIG` или `config.toml`, затем использует `config.example.toml` или значения по умолчанию. Не изменяйте личный `config.toml` для тестов. CLI: `run`, `submit`, `status`, `list`, `recover`, `cancel`, `models`, `report`, `watch`.

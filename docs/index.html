@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Orchestrator</title>
+<meta name="description" content="A local Python orchestrator that hands coding tasks to Antigravity through Agent-Bridge, verifies every result with Codex, and retries until the work really passes.">
+<meta property="og:title" content="Agent Orchestrator">
+<meta property="og:description" content="Antigravity writes the code. Codex checks it. The loop runs until it really passes.">
+<meta property="og:type" content="website">
+<style>
+:root {
+  --bg: #fbfbfc; --bg2: #f1f3f6; --panel: #ffffff; --ink: #161a1f; --muted: #5d6876; --line: #e1e5ea;
+  --accent: #2f6fde; --accent-ink: #ffffff; --ok: #1d8a4b; --bad: #c4382f; --warn: #b4741a;
+  --term: #0e1217; --term-ink: #d5dde6; --term-dim: #7d8a99; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0c1015; --bg2: #11161d; --panel: #141a22; --ink: #e6edf3; --muted: #8e9aaa; --line: #252f3c;
+          --accent: #5b96f6; --ok: #3fb96f; --bad: #f0685f; --warn: #e1a53b; --term: #080b0f; --shadow: none; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+a { color: var(--accent); }
+code, pre, .mono { font-family: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace; }
+code { font-size: .9em; background: var(--bg2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+nav.top { position: sticky; top: 0; z-index: 5; backdrop-filter: blur(8px);
+          background: color-mix(in srgb, var(--bg) 82%, transparent); border-bottom: 1px solid var(--line); }
+nav.top .wrap { display: flex; align-items: center; gap: 22px; height: 56px; }
+nav.top .brand { font-weight: 700; color: var(--ink); text-decoration: none; display: flex; align-items: center; gap: 9px; }
+nav.top .links { display: flex; gap: 18px; margin-left: auto; font-size: 14px; }
+nav.top .links a { color: var(--muted); text-decoration: none; }
+nav.top .links a:hover { color: var(--ink); }
+@media (max-width: 720px) { nav.top .links a.opt { display: none; } }
+.logo { width: 24px; height: 24px; }
+header.hero { padding: 72px 0 48px; }
+.hero h1 { font-size: clamp(34px, 6vw, 56px); line-height: 1.08; letter-spacing: -.02em; margin: 0 0 18px; }
+.hero h1 span { color: var(--accent); }
+.hero p.lead { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 720px; margin: 0 0 28px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 9px; font-weight: 600;
+       text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--panel); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn:hover { filter: brightness(1.06); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
+.chip { font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px; background: var(--panel); }
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+section h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.01em; margin: 0 0 10px; }
+section p.sub { color: var(--muted); margin: 0 0 28px; max-width: 760px; }
+.diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: var(--shadow); overflow-x: auto; }
+.diagram svg { display: block; width: 100%; min-width: 600px; height: auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }
+.card h3 { margin: 0 0 8px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+.card .ic { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; margin-bottom: 12px;
+            background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-weight: 700; }
+.term { background: var(--term); color: var(--term-ink); border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
+.term .bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #1f2731; color: var(--term-dim); font-size: 13px; }
+.term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a4452; display: inline-block; }
+.term .bar .grow { flex: 1; }
+.term .bar button { background: none; border: 1px solid #2c3644; color: var(--term-ink); border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; }
+.term pre { margin: 0; padding: 14px 16px; height: 420px; overflow: auto; font-size: 13px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.term .t { color: var(--term-dim); }
+.term .tool { color: #8cc4ff; } .term .good { color: #6fdc96; } .term .badl { color: #ff8f86; } .term .step { color: #f2c66d; }
+.caption { color: var(--muted); font-size: 14px; margin-top: 10px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 15px; }
+th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--bg2); }
+tr:last-child td { border-bottom: 0; }
+.tablewrap { overflow-x: auto; border-radius: 12px; }
+.tag { display: inline-block; font-size: 12px; font-weight: 700; border-radius: 6px; padding: 1px 8px; white-space: nowrap; }
+.tag.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.tag.bug { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.shot { border-radius: 12px; border: 1px solid var(--line); box-shadow: var(--shadow); width: 100%; height: auto; display: block; }
+.steps { counter-reset: step; display: grid; gap: 18px; }
+.steps > div { position: relative; padding-left: 46px; }
+.steps > div::before { counter-increment: step; content: counter(step); position: absolute; left: 0; top: 0; width: 30px; height: 30px;
+                       border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 14px;
+                       background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.steps h3 { margin: 2px 0 6px; font-size: 17px; }
+pre.code { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 8px 0 0; font-size: 14px; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; align-items: start; }
+.two > *, .steps > div { min-width: 0; }
+@media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+footer { border-top: 1px solid var(--line); padding: 30px 0 46px; color: var(--muted); font-size: 14px; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; }
+.note { font-size: 14px; color: var(--muted); border-left: 3px solid var(--line); padding: 4px 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<nav class="top"><div class="wrap">
+  <a class="brand" href="#"><svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 6v6l4 2" fill="none" stroke="#2f6fde" stroke-width="2.2" stroke-linecap="round"/></svg>Agent Orchestrator</a>
+  <div class="links">
+    <a href="#how">How it works</a>
+    <a class="opt" href="#real-run">Real run</a>
+    <a class="opt" href="#dashboard">Dashboard</a>
+    <a href="#start">Quick start</a>
+    <a href="https://github.com/QosmuratSamat0/agent-orchestrator">GitHub</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <h1>Antigravity writes the code.<br><span>Codex checks it.</span> The loop runs until it really passes.</h1>
+  <p class="lead">Agent Orchestrator is a small local Python tool. It hands a coding task to Antigravity through Agent-Bridge, waits without burning LLM tokens, has Codex verify the result against your acceptance criteria, and sends concrete feedback back until the work passes, fails for good, or runs out of time.</p>
+  <div class="cta">
+    <a class="btn primary" href="#start">Get started</a>
+    <a class="btn" href="https://github.com/QosmuratSamat0/agent-orchestrator">View on GitHub</a>
+  </div>
+  <div class="chips">
+    <span class="chip">Python 3.11 · standard library only</span>
+    <span class="chip">SQLite, crash-safe</span>
+    <span class="chip">260+ tests</span>
+    <span class="chip">Verified with the real tools</span>
+    <span class="chip">MIT license</span>
+  </div>
+</div></header>
+
+<section id="how"><div class="wrap">
+  <h2>How it works</h2>
+  <p class="sub">One loop, with a single 45-minute budget for the whole task, covering every attempt, every wait and every verification. There is no retry counter: a task stops only when it passes, fails for good, is cancelled, or the budget runs out.</p>
+  <div class="diagram">
+    <svg viewBox="0 0 900 330" role="img" aria-labelledby="dg-t dg-d">
+      <title id="dg-t">The orchestration loop</title>
+      <desc id="dg-d">A task is dispatched to Antigravity, the orchestrator waits without an LLM, collects the git diff, and Codex verifies it. PASSED completes the task, FAILED stops it, RETRY_NEEDED sends the feedback back to dispatch.</desc>
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+        <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--warn)"/></marker>
+      </defs>
+      <rect x="6" y="6" width="888" height="318" rx="16" fill="none" stroke="var(--line)" stroke-dasharray="6 6"/>
+      <text x="22" y="30" fill="var(--muted)" font-size="13" font-family="system-ui, sans-serif">One task budget: 45 minutes, anchored on the saved start time (survives restarts)</text>
+      <g font-family="system-ui, sans-serif" text-anchor="middle">
+        <g><rect x="30" y="120" width="120" height="70" rx="12" fill="var(--bg2)" stroke="var(--line)"/>
+          <text x="90" y="150" fill="var(--ink)" font-size="16" font-weight="700">Task</text>
+          <text x="90" y="172" fill="var(--muted)" font-size="12">SQLite</text></g>
+        <g><rect x="176" y="120" width="178" height="70" rx="12" fill="var(--panel)" stroke="var(--accent)"/>
+          <text x="265" y="150" fill="var(--ink)" font-size="16" font-weight="700">Dispatch</text>
+          <text x="265" y="172" fill="var(--muted)" font-size="12">Agent-Bridge → Antigravity</text></g>
+        <g><rect x="380" y="120" width="140" height="70" rx="12" fill="var(--panel)" stroke="var(--accent)"/>
+          <text x="450" y="150" fill="var(--ink)" font-size="16" font-weight="700">Wait</text>
+          <text x="450" y="172" fill="var(--muted)" font-size="12">no LLM polling</text></g>
+        <g><rect x="560" y="120" width="140" height="70" rx="12" fill="var(--panel)" stroke="var(--accent)"/>
+          <text x="630" y="150" fill="var(--ink)" font-size="16" font-weight="700">Verify</text>
+          <text x="630" y="172" fill="var(--muted)" font-size="12">Codex + git diff</text></g>
+        <g><rect x="745" y="56" width="125" height="52" rx="12" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)"/>
+          <text x="807" y="88" fill="var(--ok)" font-size="15" font-weight="700">PASSED ✓</text></g>
+        <g><rect x="745" y="200" width="125" height="52" rx="12" fill="color-mix(in srgb, var(--bad) 12%, transparent)" stroke="var(--bad)"/>
+          <text x="807" y="232" fill="var(--bad)" font-size="15" font-weight="700">FAILED ✗</text></g>
+        <text x="455" y="300" fill="var(--warn)" font-size="14" font-weight="700">RETRY_NEEDED: the verifier's feedback becomes the next prompt</text>
+      </g>
+      <g stroke="var(--muted)" stroke-width="2" fill="none">
+        <path d="M150 155 H172" marker-end="url(#ar)"/>
+        <path d="M354 155 H376" marker-end="url(#ar)"/>
+        <path d="M520 155 H556" marker-end="url(#ar)"/>
+        <path d="M700 140 C720 120 725 90 741 84" marker-end="url(#ar)"/>
+        <path d="M700 170 C720 190 725 220 741 226" marker-end="url(#ar)"/>
+      </g>
+      <path d="M630 190 V275 H265 V194" fill="none" stroke="var(--warn)" stroke-width="2.4" marker-end="url(#arA)"/>
+    </svg>
+  </div>
+</div></section>
+
+<section id="reliable"><div class="wrap">
+  <h2>Built to be left alone</h2>
+  <p class="sub">The hard part of running coding agents unattended is not the happy path. It is crashes, cancels, flaky output and "passed" that was never really checked.</p>
+  <div class="cards">
+    <div class="card"><div class="ic">↻</div><h3>Unlimited retries, one budget</h3><p>RETRY_NEEDED loops back with the verifier's concrete feedback. A single 45-minute budget, saved in the database, bounds the whole task, even across restarts.</p></div>
+    <div class="card"><div class="ic">✓</div><h3>"Passed" has to be proven</h3><p>The verdict comes only from Codex's final answer. Exit code ≠ 0 means failed. Required tests need real evidence: the actual command, its exit code and the runner's summary line. The verifier may not touch your files.</p></div>
+    <div class="card"><div class="ic">⟲</div><h3>Crash-safe recovery</h3><p><code>recover</code> resumes, verifies or closes interrupted tasks and never starts the same work twice. Tasks owned by a dead Bridge process are marked, not re-run.</p></div>
+    <div class="card"><div class="ic">■</div><h3>A cancel always wins</h3><p>The database is the source of truth. A cancel from another terminal or the dashboard stops the worker within about 10 seconds and can never be overwritten by a late "completed".</p></div>
+    <div class="card"><div class="ic">◉</div><h3>See what the agent is doing</h3><p>A live feed shows each step of the agent: files read, commands run, test results. Follow it in the terminal, with <code>watch</code>, or in the local dashboard.</p></div>
+    <div class="card"><div class="ic">⚙</div><h3>A hardened Bridge client</h3><p>It survives timeouts, noisy or broken output, huge stderr streams and process crashes. Closing always finishes in bounded time and leaves no stray processes.</p></div>
+  </div>
+</div></section>
+
+<section id="real-run"><div class="wrap">
+  <h2>A real run, replayed</h2>
+  <p class="sub">This is the actual live log of a real run on a throwaway repo: <code>calc.py</code> had a deliberate bug (<code>add()</code> subtracted). Antigravity reads the files, sees the test fail, fixes the code and re-runs the tests. Codex then verifies it independently. The tool's own interface is in Russian; only file paths are shortened.</p>
+  <div class="term" aria-label="Replay of a real orchestrator log">
+    <div class="bar"><i></i><i></i><i></i><span class="grow mono">orchestrator_logs/6732a197.log</span><button id="replay" type="button">Replay</button></div>
+    <pre id="log" aria-live="off"></pre>
+  </div>
+  <p class="caption">Total: about 70 seconds from dispatch to a verified PASSED. Every line above is real output. Times are local.</p>
+</div></section>
+
+<section id="verified"><div class="wrap">
+  <h2>Tested against the real tools</h2>
+  <p class="sub">Over 260 automated tests use mocks and fake programs. Mocks can be wrong, so every claim was also checked with real Agent-Bridge, Antigravity and Codex on a sandbox repo. The real runs found four bugs that all the mocked tests had missed.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Real check</th><th>Result</th><th>What it proved or fixed</th></tr></thead>
+    <tbody>
+      <tr><td>First dispatch</td><td><span class="tag bug">bug fixed</span></td><td>The Bridge requires <code>request_id</code> to be a UUID. Now a deterministic UUIDv5 per attempt.</td></tr>
+      <tr><td>Worker start</td><td><span class="tag bug">bug fixed</span></td><td><code>agy</code> rejects a leveled model (<code>…-high</code>) plus a separate effort. The model name is now the only source of the level.</td></tr>
+      <tr><td>Fix a bug end to end</td><td><span class="tag ok">passed</span></td><td>Real Codex event format recognised. Test proof extracted from the real command (<code>pytest</code>, exit 0, "1 passed").</td></tr>
+      <tr><td>Live feed</td><td><span class="tag bug">bug fixed</span></td><td>Real transcript events are nested. The feed now shows readable steps instead of bare event names.</td></tr>
+      <tr><td>Cancel while working</td><td><span class="tag ok">passed</span></td><td>Stopped 9.9 s after the cancel. The agent's own log ends with <code>cancelled</code>. No file changed.</td></tr>
+      <tr><td>Orchestrator crash</td><td><span class="tag ok">passed</span></td><td>The Bridge cancels the task and stops its worker. <code>recover</code> closes the task without re-running it.</td></tr>
+      <tr><td>Hard crash of everything</td><td><span class="tag ok">passed</span></td><td>The new Bridge marks the task <code>bridge_restarted</code>. <code>recover</code> fails it cleanly, with nothing left running.</td></tr>
+      <tr><td>Cancel of a finished task</td><td><span class="tag bug">bug fixed</span></td><td>The CLI now says the task is already finished instead of claiming a cancel was recorded.</td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="dashboard"><div class="wrap">
+  <h2>Local dashboard</h2>
+  <p class="sub">Run <code>agent-orchestrator dashboard --open</code> to follow every task in your browser: status, attempt, time left, verifier notes, the event history and the live agent journal. It runs only on your own computer, reads your local database, and never starts an agent itself.</p>
+  <img class="shot" src="assets/dashboard.png" width="1280" height="860" alt="The local dashboard: a list of tasks on the left; on the right a completed task with verdict passed, the verifier's notes, its events and the live Antigravity journal">
+  <p class="note">Security by design: it listens on 127.0.0.1 only, rejects foreign <code>Host</code> headers (DNS rebinding), inserts all task text as plain text, and the one write action, cancel, requires a secret token created at startup.</p>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <h2>Quick start</h2>
+  <p class="sub">Windows-first, standard library only. You need Python 3.11+, <a href="https://github.com/FeiZhuLulu/Agent-Bridge">Agent-Bridge</a> on your PATH, the Antigravity CLI (<code>agy</code>) and the Codex CLI.</p>
+  <div class="two">
+    <div class="steps">
+      <div><h3>Install</h3>
+        <pre class="code">git clone https://github.com/QosmuratSamat0/agent-orchestrator
+cd agent-orchestrator
+python -m pip install -e .</pre></div>
+      <div><h3>Configure</h3>
+        <p>Copy <code>config.example.toml</code> to <code>config.toml</code> and set the paths to <code>codex.exe</code> and <code>agy.exe</code>. Defaults: a 2700 s task budget and live progress every 10 s.</p></div>
+      <div><h3>Run a task</h3>
+        <pre class="code">agent-orchestrator run -t "Fix add" \
+  -p "Fix the bug in calc.py" \
+  -a "pytest must pass" \
+  -d C:\path\to\your\repo</pre></div>
+      <div><h3>Watch it</h3>
+        <pre class="code">agent-orchestrator watch
+agent-orchestrator dashboard --open</pre></div>
+    </div>
+    <div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>run</code></td><td>Create a task and run the full loop</td></tr>
+          <tr><td><code>submit</code></td><td>Queue a task without running it</td></tr>
+          <tr><td><code>status</code> / <code>list</code></td><td>Show one task or all tasks</td></tr>
+          <tr><td><code>watch</code></td><td>Follow a task live in the terminal (read-only)</td></tr>
+          <tr><td><code>dashboard</code></td><td>Local web dashboard on 127.0.0.1</td></tr>
+          <tr><td><code>cancel</code></td><td>Cancel a task; the running orchestrator stops the worker</td></tr>
+          <tr><td><code>recover</code></td><td>Resume or close tasks interrupted by a crash</td></tr>
+          <tr><td><code>report</code></td><td>Print a task's diagnostic report</td></tr>
+          <tr><td><code>models</code></td><td>Show available Antigravity models and routing</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">Every finished task also writes <code>orchestrator_report_&lt;id&gt;.md</code> into its working directory: verdict, test evidence, git diff and the full event history.</p>
+    </div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <span>Agent Orchestrator · © 2026 QosmuratSamat0 · <a href="https://github.com/QosmuratSamat0/agent-orchestrator/blob/main/LICENSE">MIT License</a></span>
+  <span>Not affiliated with Google, OpenAI or the Agent-Bridge authors.</span>
+</div></footer>
+
+<script>
+"use strict";
+const REPLAY = [["05:51:30", "Отправка попытки 1, модель gemini-3.8-flash-high"], ["05:51:47", "статус running, тишина 6 с, прошло 0 с, осталось 44:43"], ["05:51:47", "prompt_sent: Fix the bug in calc.py so add() returns the sum of its two arguments. Do not change test_calc.py."], ["05:51:47", "старт агента: модель gemini-3.8-flash-high"], ["05:51:57", "статус running, тишина 1 с, прошло 10 с, осталось 44:33"], ["05:51:57", "ответ агента [DONE]"], ["05:51:57", "инструмент view_file ao-sandbox\\calc.py [ACTIVE]"], ["05:51:57", "инструмент view_file ao-sandbox\\calc.py [DONE] → 3 lines, 34 bytes"], ["05:51:57", "ответ агента [DONE]"], ["05:51:57", "инструмент view_file ao-sandbox\\test_calc.py [ACTIVE]"], ["05:51:57", "инструмент view_file ao-sandbox\\test_calc.py [DONE] → 6 lines, 70 bytes"], ["05:51:57", "ответ агента [DONE]"], ["05:51:57", "инструмент run_command pytest [ACTIVE]"], ["05:51:57", "инструмент run_command pytest [DONE] → 1 failed in 0.49s"], ["05:52:07", "статус running, тишина 1 с, прошло 20 с, осталось 44:22"], ["05:52:07", "ответ агента [DONE]"], ["05:52:07", "инструмент replace_file_content ao-sandbox\\calc.py [ACTIVE]"], ["05:52:07", "инструмент replace_file_content ao-sandbox\\calc.py [DONE]"], ["05:52:07", "ответ агента [DONE]"], ["05:52:07", "инструмент run_command pytest [ACTIVE]"], ["05:52:07", "инструмент run_command pytest [DONE] → 1 passed in 0.03s"], ["05:52:07", "ответ агента [DONE]"], ["05:52:07", "инструмент run_command git status [ACTIVE]"], ["05:52:07", "инструмент run_command git status [DONE] → no changes added to commit (use \"git add\" and/or \"git commit -a\")"], ["05:52:10", "статус completed, прошло 23 с, осталось 44:19"], ["05:52:10", "ответ агента [ACTIVE]"], ["05:52:10", "ответ агента [DONE]"], ["05:52:10", "конец хода: end_turn"], ["05:52:11", "Работа Antigravity завершена"], ["05:52:11", "Проверка начата"], ["05:52:39", "Вердикт: passed; - Исправление корректно; критерий приёмки выполнен. - Проверочный файл не изменён; замечаний нет."], ["05:52:39", "Итоговый статус: completed"]];
+const log = document.getElementById("log");
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+let timer = null;
+
+function classify(message) {
+  if (/^инструмент/.test(message)) return /\[DONE\].*(passed|✓)/.test(message) ? "good" : /failed/.test(message) ? "badl" : "tool";
+  if (/^(Вердикт: passed|Итоговый статус: completed)/.test(message)) return "good";
+  if (/^(Отправка|Работа Antigravity|Проверка начата|старт агента|конец хода)/.test(message)) return "step";
+  return "";
+}
+function line([time, message]) {
+  const row = document.createElement("div");
+  const stamp = document.createElement("span");
+  stamp.className = "t";
+  stamp.textContent = "[" + time + "] ";
+  const text = document.createElement("span");
+  text.className = classify(message);
+  text.textContent = message;
+  row.append(stamp, text);
+  return row;
+}
+function play() {
+  clearTimeout(timer);
+  log.replaceChildren();
+  if (reduced) { REPLAY.forEach(entry => log.append(line(entry))); return; }
+  let index = 0;
+  const next = () => {
+    if (index >= REPLAY.length) return;
+    log.append(line(REPLAY[index++]));
+    log.scrollTop = log.scrollHeight;
+    timer = setTimeout(next, index < 3 ? 650 : 260);
+  };
+  next();
+}
+document.getElementById("replay").addEventListener("click", play);
+const observer = new IntersectionObserver(entries => {
+  if (entries.some(entry => entry.isIntersecting)) { play(); observer.disconnect(); }
+}, { threshold: 0.25 });
+observer.observe(log);
+</script>
+</body>
+</html>
